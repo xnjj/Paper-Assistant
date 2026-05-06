@@ -1,0 +1,16 @@
+{
+  "name": "rag-paper-assistant",
+  "private": true,
+  "version": "0.1.0",
+  "workspaces": [
+    "frontend",
+    "desktop"
+  ],
+  "scripts": {
+    "dev": "concurrently \"npm --workspace frontend run dev\" \"npm --workspace desktop run dev\"",
+    "build": "npm --workspace frontend run build && npm --workspace desktop run build"
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.2"
+  }
+}
