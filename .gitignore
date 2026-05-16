@@ -6,17 +6,18 @@ __pycache__/
 *.pyd
 .pytest_cache/
 
-backend/.pytest_cache/
-backend/data/app.db
-backend/data/chroma/
-backend/data/uploads/
-backend/data/generated/
+.history/
+node_modules/
+paper_demo/
+test/
+test_outputs/
 
-frontend/node_modules/
-frontend/dist/
-
-desktop/node_modules/
-desktop/dist/
+rag-paper-assistant/node_modules/
+rag-paper-assistant/dist/
+rag-paper-assistant/release/
+dist-backend/
+build/pyinstaller/
+daily_papers/
 
 .DS_Store
 Thumbs.db

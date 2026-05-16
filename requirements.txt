@@ -9,3 +9,4 @@ langchain-chroma
 langchain-text-splitters
 chromadb
 PyMuPDF
+pyinstaller

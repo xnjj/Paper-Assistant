@@ -535,4 +535,5 @@ if __name__ == "__main__":
 
     host = os.getenv("UPLOAD_API_HOST", "127.0.0.1")
     port = int(os.getenv("UPLOAD_API_PORT", "8000"))
-    uvicorn.run("upload_api:app", host=host, port=port, reload=True)
+    reload_enabled = os.getenv("UPLOAD_API_RELOAD", "1") == "1"
+    uvicorn.run("upload_api:app", host=host, port=port, reload=reload_enabled)

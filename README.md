@@ -7,6 +7,23 @@
 - 参考文献展示与引用绑定
 - Electron + Vue 桌面端交互界面
 
+# 项目预览
+
+<!-- ...existing code... -->
+<table style="border-collapse: collapse; border: none;">
+
+  <tr>
+    <td style="border: none;"><img src="f0854ffc1f11cd1dc67ebb45d6e65a79.png" width="300"/></td>
+    <td style="border: none;"><img src="image-3.png" width="300"/></td>
+    <td style="border: none;"><img src="image-4.png" width="300"/></td>
+  </tr>
+    <tr>
+    <td style="border: none;"><img src="image.png" width="300"/></td>
+    <td style="border: none;"><img src="image-1.png" width="170"/></td>
+    <td style="border: none;"><img src="image-2.png" width="300"/></td>
+  </tr>
+</table>
+<!-- ...existing code... -->
 ## 项目结构
 
 ```text
@@ -78,6 +95,9 @@ npm run dev
 
 - `npm run dev`：启动 Electron + Vue 开发环境
 - `npm run build`：构建桌面端产物
+- `npm run build:backend`：使用 PyInstaller 构建后端可执行文件
+- `npm run pack`：生成不安装的桌面应用目录
+- `npm run dist`：生成 Windows 安装包
 - `npm run lint`：执行前端 lint
 - `npm run type-check`：执行前端类型检查
 
@@ -98,6 +118,40 @@ npm run dev
 - 默认分块方式为递归分割
 - 文献库支持独立的向量模型、最大输入长度与分块模式配置
 - 语义分块配置项已预留，但当前运行时仍回退到递归分割
+
+## Windows 桌面安装包发布
+
+当前项目已经接入 Windows 桌面发布链路：
+
+1. 前端使用 Electron + Vite 构建
+2. 后端使用 PyInstaller 打包为本地可执行文件
+3. 生产模式下 Electron 会自动拉起内置后端
+
+首次发布前请先安装依赖：
+
+```powershell
+pip install -r requirements.txt
+cd rag-paper-assistan
+npm install
+cd ..
+```
+
+然后在项目根目录执行：
+
+```powershell
+npm run dist
+```
+
+生成结果默认位于：
+
+```text
+rag-paper-assistan/release/
+```
+
+补充说明：
+
+- 打包后的桌面应用会自动启动内置 Python 后端
+- 运行数据会写入桌面应用对应的用户数据目录，而不是安装目录
 
 ## 开发说明
 
