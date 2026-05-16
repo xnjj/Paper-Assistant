@@ -8,45 +8,42 @@ from app_backend.models import MessageRecord, SessionRecord
 
 
 class SessionRepository:
-    """会话与消息仓储。"""
+    """Repository for chat sessions and messages."""
 
     def __init__(self, db_manager: DatabaseManager) -> None:
-        """初始化会话仓储。
+        """Initialize the session repository.
 
         Args:
-            db_manager: SQLite 连接管理器。
+            db_manager: Shared SQLite connection manager.
         """
         self.db_manager = db_manager
 
-    def create_session(self, title: str, user_goal: str) -> int:
-        """创建一个新会话。
-
-        Args:
-            title: 会话标题。
-            user_goal: 用户当前研究目标或任务描述。
-
-        Returns:
-            int: 新会话主键。
-        """
+    def create_session(self, title: str, user_goal: str, library_id: int) -> int:
+        """Create a new chat session bound to one library."""
         now = datetime.now().isoformat(timespec="seconds")
         with self.db_manager.get_connection() as connection:
             cursor = connection.execute(
                 """
-                INSERT INTO chat_sessions(title, user_goal, is_pinned, created_at, updated_at)
-                VALUES(?, ?, 0, ?, ?)
+                INSERT INTO chat_sessions(
+                    library_id, title, user_goal, is_pinned, created_at, updated_at
+                )
+                VALUES(?, ?, ?, 0, ?, ?)
                 """,
-                (title, user_goal, now, now),
+                (library_id, title, user_goal, now, now),
             )
             return int(cursor.lastrowid)
 
     def get_session(self, session_id: int) -> SessionRecord | None:
-        """读取单个会话。"""
+        """Fetch one session."""
         with self.db_manager.get_connection() as connection:
-            row = connection.execute("SELECT * FROM chat_sessions WHERE id = ?", (session_id,)).fetchone()
+            row = connection.execute(
+                "SELECT * FROM chat_sessions WHERE id = ?",
+                (session_id,),
+            ).fetchone()
             return self._map_session(row) if row else None
 
     def list_sessions(self) -> list[SessionRecord]:
-        """返回全部会话，置顶优先，其余按更新时间倒序。"""
+        """Return all sessions, pinned first and then by recent activity."""
         with self.db_manager.get_connection() as connection:
             rows = connection.execute(
                 """
@@ -58,15 +55,7 @@ class SessionRepository:
             return [self._map_session(row) for row in rows]
 
     def update_session_title(self, session_id: int, title: str) -> bool:
-        """更新会话标题。
-
-        Args:
-            session_id: 目标会话主键。
-            title: 新标题。
-
-        Returns:
-            bool: 是否成功更新到记录。
-        """
+        """Update the visible title of one session."""
         now = datetime.now().isoformat(timespec="seconds")
         with self.db_manager.get_connection() as connection:
             cursor = connection.execute(
@@ -80,15 +69,7 @@ class SessionRepository:
             return cursor.rowcount > 0
 
     def update_session_pin_status(self, session_id: int, is_pinned: bool) -> bool:
-        """更新会话置顶状态。
-
-        Args:
-            session_id: 目标会话主键。
-            is_pinned: 是否置顶。
-
-        Returns:
-            bool: 是否更新成功。
-        """
+        """Toggle the pinned state of a session."""
         with self.db_manager.get_connection() as connection:
             cursor = connection.execute(
                 """
@@ -101,15 +82,30 @@ class SessionRepository:
             return cursor.rowcount > 0
 
     def delete_session(self, session_id: int) -> bool:
-        """删除会话及其关联消息和会话记忆。"""
+        """Delete a session together with its messages and session memories."""
         with self.db_manager.get_connection() as connection:
             connection.execute("DELETE FROM chat_messages WHERE session_id = ?", (session_id,))
             connection.execute("DELETE FROM memories WHERE session_id = ?", (session_id,))
             cursor = connection.execute("DELETE FROM chat_sessions WHERE id = ?", (session_id,))
             return cursor.rowcount > 0
 
-    def add_message(self, session_id: int, role: str, content: str, retrieval_context: dict | None = None) -> int:
-        """向会话写入一条消息。"""
+    def count_sessions_for_library(self, library_id: int) -> int:
+        """Return how many sessions currently depend on a library."""
+        with self.db_manager.get_connection() as connection:
+            row = connection.execute(
+                "SELECT COUNT(*) AS count FROM chat_sessions WHERE library_id = ?",
+                (library_id,),
+            ).fetchone()
+            return int(row["count"]) if row else 0
+
+    def add_message(
+        self,
+        session_id: int,
+        role: str,
+        content: str,
+        retrieval_context: dict | None = None,
+    ) -> int:
+        """Append one chat message to a session."""
         now = datetime.now().isoformat(timespec="seconds")
         with self.db_manager.get_connection() as connection:
             cursor = connection.execute(
@@ -126,7 +122,7 @@ class SessionRepository:
             return int(cursor.lastrowid)
 
     def list_messages(self, session_id: int) -> list[MessageRecord]:
-        """读取会话下的全部消息。"""
+        """Return the full ordered message history for one session."""
         with self.db_manager.get_connection() as connection:
             rows = connection.execute(
                 "SELECT * FROM chat_messages WHERE session_id = ? ORDER BY id ASC",
@@ -136,7 +132,7 @@ class SessionRepository:
 
     @staticmethod
     def _map_session(row) -> SessionRecord:
-        """把数据库行转换成会话记录对象。"""
+        """Convert one SQLite row into a session dataclass."""
         payload = dict(row)
         payload["is_pinned"] = bool(payload.get("is_pinned", 0))
         return SessionRecord(**payload)

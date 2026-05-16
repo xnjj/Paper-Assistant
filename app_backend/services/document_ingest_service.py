@@ -2,106 +2,256 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from app_backend.models import IngestResult
+from app_backend.models import DocumentRecord, IngestResult, LibraryRecord, ParsedDocument
 from app_backend.repositories.document_repository import DocumentRepository
+from app_backend.repositories.library_repository import LibraryRepository
 from app_backend.services.metadata_extractor import MetadataExtractorService
 from app_backend.services.pdf_parser import PDFParserService
 from app_backend.services.vector_index_service import VectorIndexService
 
 
 class DocumentIngestService:
-    """文献入库编排服务。
+    """Document ingest orchestrator.
 
-    该层负责编排完整的入库流程：
-    `PDF 解析 -> 元数据抽取 -> 结构化入库 -> 切片与向量索引`
+    This service coordinates:
+    PDF parsing -> metadata extraction -> structured persistence ->
+    chunking and vector indexing.
     """
 
     def __init__(
         self,
         document_repository: DocumentRepository,
+        library_repository: LibraryRepository,
         pdf_parser: PDFParserService,
         metadata_extractor: MetadataExtractorService,
         vector_index_service: VectorIndexService,
     ) -> None:
-        """初始化文献入库编排服务。
+        """Initialize the ingest service.
 
         Args:
-            document_repository: 文献结构化仓储。
-            pdf_parser: PDF 解析服务。
-            metadata_extractor: 元数据抽取服务。
-            vector_index_service: 向量切片与索引服务。
+            document_repository: Structured document repository.
+            library_repository: Library repository used to resolve the target library.
+            pdf_parser: PDF parser service.
+            metadata_extractor: Metadata extraction service.
+            vector_index_service: Vector chunking and indexing service.
         """
         self.document_repository = document_repository
+        self.library_repository = library_repository
         self.pdf_parser = pdf_parser
         self.metadata_extractor = metadata_extractor
         self.vector_index_service = vector_index_service
 
-    def ingest_paths(self, pdf_paths: list[str], source_type: str = "local_folder") -> list[IngestResult]:
-        """批量处理一组 PDF 路径。
+    def ingest_paths(
+        self,
+        pdf_paths: list[str],
+        source_type: str = "local_folder",
+        library_id: int | None = None,
+    ) -> list[IngestResult]:
+        """Batch ingest a list of PDF files into one library.
 
         Args:
-            pdf_paths: 待处理文件路径列表。
-            source_type: 文献来源类型，如 `upload`、`local_folder`、`arxiv`。
-
-        Returns:
-            list[IngestResult]: 逐文件的处理结果，用于 API 直接返回给前端。
+            pdf_paths: File paths to ingest.
+            source_type: Document source label such as `upload` or `local_folder`.
+            library_id: Explicit target library id.
         """
-        results: list[IngestResult] = []
-        for path in pdf_paths:
-            try:
-                parsed_document = self.pdf_parser.parse(path)
-                existing_document = self.document_repository.get_by_file_hash(parsed_document.file_hash)
-                if existing_document is not None:
-                    results.append(
-                        IngestResult(
-                            path=parsed_document.file_path,
-                            success=True,
-                            status="duplicate",
-                            title=existing_document.title,
-                            file_hash=parsed_document.file_hash,
-                            document_id=existing_document.id,
-                            error="相同文件内容已入库。",
-                        )
+        library = self._resolve_library(library_id)
+        return [
+            self._ingest_one_path(
+                path=path,
+                source_type=source_type,
+                library=library,
+            )
+            for path in pdf_paths
+        ]
+
+    def ingest_path(
+        self,
+        pdf_path: str,
+        source_type: str = "local_folder",
+        library_id: int | None = None,
+    ) -> IngestResult:
+        """Ingest one PDF file into one library."""
+        library = self._resolve_library(library_id)
+        return self._ingest_one_path(
+            path=pdf_path,
+            source_type=source_type,
+            library=library,
+        )
+
+    def compute_file_hash(self, pdf_path: str) -> str:
+        """Compute the content hash of one PDF file without full parsing."""
+        return self.pdf_parser.compute_file_hash(pdf_path)
+
+    def _resolve_library(self, library_id: int | None) -> LibraryRecord:
+        """Resolve the target library for one ingest request."""
+        if library_id is None:
+            raise ValueError("Please choose a library before ingesting documents.")
+
+        library = self.library_repository.get_by_id(library_id)
+        if library is None:
+            raise ValueError(f"Library not found: {library_id}")
+        return library
+
+    def _ingest_one_path(
+        self,
+        *,
+        path: str,
+        source_type: str,
+        library: LibraryRecord,
+    ) -> IngestResult:
+        """Ingest one file and return its final ingest result."""
+        resolved_path = str(Path(path))
+        file_hash = ""
+        document_id: int | None = None
+        try:
+            parsed_document = self.pdf_parser.parse(path)
+            resolved_path = parsed_document.file_path
+            file_hash = parsed_document.file_hash
+            existing_document = self.document_repository.get_by_file_hash(
+                library.id,
+                parsed_document.file_hash,
+            )
+            if existing_document is not None:
+                if self._document_needs_repair(existing_document):
+                    document_id = existing_document.id
+                    self._repair_incomplete_document(
+                        library=library,
+                        document=existing_document,
+                        parsed_document=parsed_document,
                     )
-                    continue
-
-                metadata = self.metadata_extractor.extract(parsed_document)
-                document_id = self.document_repository.create_document(
-                    file_hash=parsed_document.file_hash,
-                    file_path=parsed_document.file_path,
-                    file_name=parsed_document.file_name,
-                    title=metadata.title,
-                    abstract=metadata.abstract,
-                    authors=metadata.authors,
-                    keywords=metadata.keywords,
-                    doi=metadata.doi,
-                    source_type=source_type,
-                    source_uri=parsed_document.file_path,
-                    content_text=parsed_document.raw_text,
-                    status="indexed",
-                )
-
-                indexed_chunks = self.vector_index_service.index_document(document_id, parsed_document.raw_text)
-                for chunk in indexed_chunks:
-                    self.document_repository.add_chunk(document_id=document_id, **chunk)
-
-                results.append(
-                    IngestResult(
+                    return IngestResult(
                         path=parsed_document.file_path,
                         success=True,
                         status="saved",
-                        title=metadata.title,
+                        library_id=library.id,
+                        title=existing_document.title,
                         file_hash=parsed_document.file_hash,
-                        document_id=document_id,
+                        document_id=existing_document.id,
                     )
+
+                return IngestResult(
+                    path=parsed_document.file_path,
+                    success=True,
+                    status="duplicate",
+                    library_id=library.id,
+                    title=existing_document.title,
+                    file_hash=parsed_document.file_hash,
+                    document_id=existing_document.id,
+                    error="The same file content is already stored in this library.",
                 )
-            except Exception as exc:
-                results.append(
-                    IngestResult(
-                        path=str(Path(path)),
-                        success=False,
-                        status="failed",
-                        error=str(exc),
-                    )
+
+            metadata = self.metadata_extractor.extract(parsed_document)
+            document_id = self.document_repository.create_document(
+                library_id=library.id,
+                file_hash=parsed_document.file_hash,
+                file_path=parsed_document.file_path,
+                file_name=parsed_document.file_name,
+                title=metadata.title,
+                abstract=metadata.abstract,
+                authors=metadata.authors,
+                keywords=metadata.keywords,
+                year=metadata.year,
+                doi=metadata.doi,
+                url=metadata.url,
+                venue=metadata.venue,
+                citation_text_default=metadata.citation_text_default,
+                source_type=source_type,
+                source_uri=parsed_document.file_path,
+                content_text=parsed_document.raw_text,
+                status="indexing",
+            )
+            self._index_document_contents(
+                library=library,
+                document_id=document_id,
+                text=parsed_document.raw_text,
+            )
+            self.document_repository.update_document_index_state(
+                document_id,
+                status="indexed",
+                content_text=parsed_document.raw_text,
+            )
+
+            return IngestResult(
+                path=parsed_document.file_path,
+                success=True,
+                status="saved",
+                library_id=library.id,
+                title=metadata.title,
+                file_hash=parsed_document.file_hash,
+                document_id=document_id,
+            )
+        except Exception as exc:
+            if document_id is not None:
+                self.document_repository.update_document_index_state(
+                    document_id,
+                    status="index_failed",
                 )
-        return results
+            return IngestResult(
+                path=resolved_path,
+                success=False,
+                status="failed",
+                library_id=library.id,
+                file_hash=file_hash,
+                document_id=document_id,
+                error=str(exc),
+            )
+
+    def _document_needs_repair(self, document: DocumentRecord) -> bool:
+        """Return whether one existing document still needs chunk index repair."""
+        chunk_count = self.document_repository.count_chunks(document.id)
+        return document.status != "indexed" or chunk_count == 0
+
+    def _repair_incomplete_document(
+        self,
+        *,
+        library: LibraryRecord,
+        document: DocumentRecord,
+        parsed_document: ParsedDocument,
+    ) -> None:
+        """Repair one previously half-indexed document.
+
+        This path is used when a historical sync created the `documents` row but
+        failed before the vector index and `document_chunks` were fully written.
+        """
+        self.document_repository.update_document_index_state(
+            document.id,
+            status="indexing",
+            content_text=parsed_document.raw_text,
+        )
+        self.document_repository.delete_chunks(document.id)
+        self.vector_index_service.delete_document_vectors(
+            library.collection_name,
+            library.id,
+            document.id,
+        )
+        self._index_document_contents(
+            library=library,
+            document_id=document.id,
+            text=parsed_document.raw_text,
+        )
+        self.document_repository.update_document_index_state(
+            document.id,
+            status="indexed",
+            content_text=parsed_document.raw_text,
+        )
+
+    def _index_document_contents(
+        self,
+        *,
+        library: LibraryRecord,
+        document_id: int,
+        text: str,
+    ) -> None:
+        """Write vector chunks and structured chunk rows for one document."""
+        indexed_chunks = self.vector_index_service.index_document(
+            library_id=library.id,
+            collection_name=library.collection_name,
+            document_id=document_id,
+            text=text,
+        )
+        for chunk in indexed_chunks:
+            self.document_repository.add_chunk(
+                library_id=library.id,
+                document_id=document_id,
+                **chunk,
+            )

@@ -1,13 +1,58 @@
 <script setup lang="ts">
-import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref } from 'vue'
 
 interface SessionSummary {
   id: number
+  library_id: number
   title: string
   user_goal: string
   is_pinned: boolean
   created_at: string
   updated_at: string
+}
+
+interface LibrarySummary {
+  id: number
+  name: string
+  description: string
+  folder_path: string
+  collection_name: string
+  document_count: number
+  created_at: string
+  updated_at: string
+}
+
+interface LibraryDocumentSummary {
+  id: number
+  title: string
+  file_path: string
+  updated_at: string
+}
+
+interface LibraryDocumentDetails {
+  id: number
+  library_id: number
+  file_hash: string
+  file_path: string
+  file_name: string
+  title: string
+  abstract: string
+  authors: string[]
+  keywords: string[]
+  year: string
+  doi: string
+  url: string
+  venue: string
+  citation_text_default: string
+  source_type: string
+  source_uri: string
+  status: string
+  created_at: string
+  updated_at: string
+}
+
+interface LibraryDetailsResponse extends LibrarySummary {
+  documents: LibraryDocumentSummary[]
 }
 
 interface SessionMessage {
@@ -21,11 +66,36 @@ interface SessionMessage {
 
 interface RetrievedDocument {
   document_id: number
+  source_id?: string
   title: string
   abstract: string
   file_path: string
+  authors?: string[]
+  year?: string
+  venue?: string
+  doi?: string
+  url?: string
+  citation_text_default?: string
   chunk_index?: number
   chunk_text: string
+}
+
+interface CitationBinding {
+  number: number
+  source_id: string
+  document_id: number
+  text: string
+  title: string
+  abstract: string
+  file_path: string
+  authors?: string[]
+  year?: string
+  venue?: string
+  doi?: string
+  url?: string
+  citation_text_default?: string
+  chunk_index?: number
+  chunk_text?: string
 }
 
 interface RetrievedMemory {
@@ -48,6 +118,7 @@ interface UiMessage {
   createdAt: string
   retrievedDocuments: RetrievedDocument[]
   retrievedMemories: RetrievedMemory[]
+  citations: CitationBinding[]
 }
 
 interface ReferenceEntry {
@@ -61,24 +132,114 @@ interface UploadedFileRecord {
   path: string
 }
 
+interface SyncResultRecord {
+  path: string
+  success: boolean
+  status: string
+  library_id: number
+  title?: string
+  file_hash?: string
+  document_id?: number | null
+  error?: string
+}
+
 interface FolderSyncResponse {
   success: boolean
   message: string
   paper_folder: string
+  library?: LibrarySummary
   file_count?: number
   pdf_count?: number
   new_count?: number
   skipped_count?: number
   failed_count?: number
+  results?: SyncResultRecord[]
+}
+
+interface SyncJobStatusResponse extends FolderSyncResponse {
+  job_id: number
+  status: string
+  is_running: boolean
+  already_running?: boolean
+  current_index?: number
+  total_count?: number
+  current_file_name?: string
+  current_file_path?: string
+  error_message?: string
+  started_at?: string
+  finished_at?: string | null
+}
+
+interface SyncStreamProgressEvent {
+  type: 'progress'
+  library_id: number
+  file_name: string
+  path: string
+  current_index: number
+  total_count: number
+}
+
+interface SyncStreamDoneEvent extends FolderSyncResponse {
+  type: 'done'
+}
+
+interface SyncStreamErrorEvent {
+  type: 'error'
+  message: string
+}
+
+type SyncStreamEvent = SyncStreamProgressEvent | SyncStreamDoneEvent | SyncStreamErrorEvent
+
+interface PromptTemplateCard {
+  id: string
+  title: string
+  summary: string
+  template: string
 }
 
 interface SessionsResponse {
   sessions: SessionSummary[]
 }
 
+interface LibrariesResponse {
+  libraries: LibrarySummary[]
+}
+
 interface MessagesResponse {
   session_id: number
   messages: SessionMessage[]
+}
+
+interface GlobalModelConfigPayload {
+  llm_model: string
+  embedding_model: string
+  api_key: string
+  llm_context_length: number
+  embedding_max_input_tokens: number
+}
+
+interface LibraryModelConfigPayload {
+  chunk_mode: 'recursive' | 'semantic'
+  effective_chunk_mode?: 'recursive' | 'semantic'
+  semantic_chunking_enabled?: boolean
+}
+
+interface SessionModelConfigPayload {
+  recall_chunks: number
+  rerank_chunks: number
+}
+
+interface ModelConfigResponsePayload {
+  global: GlobalModelConfigPayload
+  library: LibraryModelConfigPayload
+  session: SessionModelConfigPayload
+  library_id: number | null
+}
+
+interface ModelConfigResponse {
+  success: boolean
+  message?: string
+  config: ModelConfigResponsePayload
 }
 
 interface StreamMetaEvent {
@@ -96,6 +257,7 @@ interface StreamDeltaEvent {
 interface StreamDoneEvent {
   type: 'done'
   answer: string
+  citations?: CitationBinding[]
 }
 
 interface StreamErrorEvent {
@@ -109,8 +271,10 @@ const API_BASE_URL = 'http://127.0.0.1:8000'
 
 const historyOpen = ref(true)
 const inputValue = ref('')
+const libraries = ref<LibrarySummary[]>([])
 const sessions = ref<SessionSummary[]>([])
 const activeSessionId = ref<number | null>(null)
+const activeLibraryId = ref<number | null>(null)
 const messages = ref<UiMessage[]>([])
 const currentGoal = ref('')
 const isBootstrapping = ref(true)
@@ -122,15 +286,27 @@ const renamingTitle = ref('')
 const renaming = ref(false)
 const deleteConfirmSessionId = ref<number | null>(null)
 const deletingSessionId = ref<number | null>(null)
+const deleteConfirmLibraryId = ref<number | null>(null)
+const deletingLibraryId = ref<number | null>(null)
+const viewingLibraryId = ref<number | null>(null)
+const loadingLibraryDetails = ref(false)
+const libraryDetails = ref<LibraryDetailsResponse | null>(null)
+const deletingLibraryDocumentId = ref<number | null>(null)
+const viewingLibraryDocumentId = ref<number | null>(null)
+const loadingLibraryDocumentMetadata = ref(false)
+const libraryDocumentDetails = ref<LibraryDocumentDetails | null>(null)
+const libraryDocumentMetadataError = ref('')
 const pinningSessionId = ref<number | null>(null)
 const openSessionMenuId = ref<number | null>(null)
 const messageStreamRef = ref<HTMLElement | null>(null)
+const followMessageStreamToBottom = ref(false)
 
 const fileInputRef = ref<HTMLInputElement | null>(null)
 const selectedFileNames = ref<string[]>([])
 const uploadedFiles = ref<UploadedFileRecord[]>([])
 const uploading = ref(false)
 const syncing = ref(false)
+const activeSyncJobId = ref<number | null>(null)
 const configuringFolder = ref(false)
 const configuredFolderPath = ref('')
 const configuredFolderPdfCount = ref<number | null>(null)
@@ -138,39 +314,498 @@ const activeReferenceKey = ref<string | null>(null)
 const expandedReferenceKeys = ref<Record<string, boolean>>({})
 
 const statusMessage = ref('')
+const statusMessageIsError = ref(false)
+const syncStatusMessage = ref('')
+const syncStatusMessageIsError = ref(false)
 const errorMessage = ref('')
 
-const quickPrompts = [
-  '请基于当前文献库，梳理“RAG 在论文助手中的应用现状”。',
-  '请比较多篇文献在研究问题、方法和实验结果上的差异。',
-  '请补充 2024 年之后的相关研究方向，并总结趋势。',
-  '请根据已上传论文，生成一版适合继续修改的文献综述提纲。',
+let suppressMessageStreamScroll = false
+let syncJobPollToken = 0
+
+const quickPrompts: PromptTemplateCard[] = [
+  {
+    id: 'paper-qa',
+    title: '论文问答模板',
+    summary: '围绕单篇或少量论文做定向追问，快速定位结论、方法、假设与证据来源。',
+    template:
+      '我正在阅读与“[在此填写研究主题]”相关的论文，请基于当前文献库回答我的问题：“[在此填写具体问题]”。\n\n请按以下方式作答：\n1. 先给出简明结论；\n2. 再说明依据来自哪些论文或片段；\n3. 如果文献证据不足，请明确指出；\n4. 文末列出正文中实际引用到的参考文献。',
+  },
+  {
+    id: 'review-generation',
+    title: '综述生成模板',
+    summary: '围绕一个研究方向生成中文文献综述，自动组织研究脉络、方法演进与未来趋势。',
+    template:
+      '我的研究方向为“[在此填写研究方向]”，请基于给定文献信息撰写中文文献综述。\n\n结构至少包括：\n1. 引言；\n2. 研究进展；\n3. 主要方法或主题对比；\n4. 不足与未来方向。\n\n写作要求：\n- 语言正式、连贯；\n- 尽量按主题或方法归类，而不是简单逐篇罗列；\n- 在正文中规范引用，并在文末列出正文中实际引用到的全部参考文献。',
+  },
+  {
+    id: 'method-comparison',
+    title: '方法对比模板',
+    summary: '比较多篇论文的方法差异，聚焦任务设定、核心思想、优缺点和适用场景。',
+    template:
+      '请围绕“[在此填写任务或主题]”，对当前文献库中的相关方法进行系统对比。\n\n请至少从以下维度展开：\n1. 研究问题与任务设定；\n2. 核心方法思路；\n3. 关键模型或算法差异；\n4. 优势与局限；\n5. 适用场景。\n\n如果合适，请给出表格式或分点式总结，并在文末列出正文中实际引用到的参考文献。',
+  },
+  {
+    id: 'experiment-summary',
+    title: '实验总结模板',
+    summary: '提炼实验设置与结果，帮助快速了解数据集、评价指标、对比基线和主要发现。',
+    template:
+      '请总结当前文献库中与“[在此填写研究主题]”相关论文的实验部分。\n\n请重点提炼：\n1. 使用的数据集；\n2. 评价指标；\n3. 对比基线；\n4. 主要实验结果；\n5. 作者给出的结论或解释。\n\n如果不同论文结论不一致，请指出差异来源，并在文末列出正文中实际引用到的参考文献。',
+  },
 ]
 
 const canSend = computed(() => inputValue.value.trim().length > 0 && !isSending.value)
 const desktopMode = computed(() => Boolean(window.electronAPI))
+const activeLibrary = computed(() => libraries.value.find((item) => item.id === activeLibraryId.value) ?? null)
+const activeLibraryName = computed(() => activeLibrary.value?.name ?? '')
+const libraryPanelOpen = ref(false)
+const libraryPanelTab = ref<'select' | 'create' | 'manage' | 'models'>('select')
+const panelSelectedLibraryId = ref<number | null>(null)
+const creatingLibrary = ref(false)
+const newLibraryName = ref('')
+const newLibraryDescription = ref('')
+const newLibraryFolderPath = ref('')
+const newLibraryIndexConfig = ref<{
+  embeddingModel: string
+  embeddingMaxInputTokens: number
+  chunkMode: 'recursive' | 'semantic'
+}>({
+  embeddingModel: 'text-embedding-v1',
+  embeddingMaxInputTokens: 2048,
+  chunkMode: 'recursive',
+})
+const newLibraryFieldErrors = ref({
+  name: '',
+  folderPath: '',
+  embeddingModel: '',
+  embeddingMaxInputTokens: '',
+})
+const canCreateLibrary = computed(() => !creatingLibrary.value)
+const panelSelectedLibrary = computed(
+  () => libraries.value.find((item) => item.id === panelSelectedLibraryId.value) ?? null,
+)
+const librariesByCreatedAt = computed(() =>
+  [...libraries.value].sort((left, right) => {
+    const leftTime = Date.parse(left.created_at)
+    const rightTime = Date.parse(right.created_at)
+    return leftTime - rightTime
+  }),
+)
 const activeSession = computed(() => sessions.value.find((item) => item.id === activeSessionId.value) ?? null)
 const deleteConfirmSession = computed(() => sessions.value.find((item) => item.id === deleteConfirmSessionId.value) ?? null)
+const deleteConfirmLibrary = computed(
+  () => libraries.value.find((item) => item.id === deleteConfirmLibraryId.value) ?? null,
+)
 const hasMessages = computed(() => messages.value.length > 0)
 const isHomeView = computed(() => activeSessionId.value === null && messages.value.length === 0)
+const llmModelSuggestions = ['qwen3-max', 'qwen-plus', 'gpt-4.1', 'gpt-4o', 'deepseek-chat', 'claude-3-5-sonnet']
+const embeddingModelSuggestions = [
+  'text-embedding-v4',
+  'text-embedding-v3',
+  'text-embedding-3-large',
+  'text-embedding-3-small',
+  'bge-m3',
+]
+const globalModelConfig = ref({
+  llmModel: 'qwen3-max',
+  embeddingModel: 'text-embedding-v1',
+  apiKey: '',
+  llmContextLength: 200000,
+  embeddingMaxInputTokens: 2048,
+})
+const libraryModelConfig = ref<{
+  chunkMode: 'recursive' | 'semantic'
+}>({
+  chunkMode: 'recursive',
+})
+const sessionModelConfig = ref({
+  recallChunks: 20,
+  rerankChunks: 5,
+})
+const loadingModelConfig = ref(false)
+const savingModelConfig = ref(false)
+const modelConfigFieldErrors = ref({
+  llmModel: '',
+  llmContextLength: '',
+  apiKey: '',
+  recallChunks: '',
+  rerankChunks: '',
+})
+const modelConfigDraftStatus = ref('')
+const modelConfigLibraryId = computed(() => panelSelectedLibraryId.value ?? activeLibraryId.value)
+const modelConfigTargetLibraryName = computed(
+  () => activeLibraryName.value || panelSelectedLibrary.value?.name || '当前未选择文献库',
+)
+
+function openLibraryPanel() {
+  clearFeedback()
+  closeSessionMenu()
+  libraryPanelOpen.value = true
+}
+
+function clearNewLibraryFieldErrors() {
+  newLibraryFieldErrors.value = {
+    name: '',
+    folderPath: '',
+    embeddingModel: '',
+    embeddingMaxInputTokens: '',
+  }
+}
+
+function clearModelConfigFieldErrors() {
+  modelConfigFieldErrors.value = {
+    llmModel: '',
+    llmContextLength: '',
+    apiKey: '',
+    recallChunks: '',
+    rerankChunks: '',
+  }
+}
+
+function isLibraryNameDuplicate(name: string) {
+  const normalizedName = name.trim().toLocaleLowerCase()
+  if (!normalizedName) {
+    return false
+  }
+
+  return libraries.value.some((library) => library.name.trim().toLocaleLowerCase() === normalizedName)
+}
+
+function validateNewLibraryForm() {
+  clearNewLibraryFieldErrors()
+
+  const normalizedName = newLibraryName.value.trim()
+  const normalizedFolderPath = newLibraryFolderPath.value.trim()
+  const normalizedEmbeddingModel = newLibraryIndexConfig.value.embeddingModel.trim()
+  const embeddingMaxInputTokens = Number(newLibraryIndexConfig.value.embeddingMaxInputTokens)
+
+  if (!normalizedName) {
+    newLibraryFieldErrors.value.name = '请输入文献库名称。'
+  } else if (isLibraryNameDuplicate(normalizedName)) {
+    newLibraryFieldErrors.value.name = '文献库名称已存在，请使用其他名称。'
+  }
+
+  if (!normalizedFolderPath) {
+    newLibraryFieldErrors.value.folderPath = '请选择文献文件夹。'
+  }
+
+  if (!normalizedEmbeddingModel) {
+    newLibraryFieldErrors.value.embeddingModel = '请输入向量模型。'
+  }
+
+  if (!Number.isFinite(embeddingMaxInputTokens) || embeddingMaxInputTokens <= 0) {
+    newLibraryFieldErrors.value.embeddingMaxInputTokens = '请输入大于 0 的 Token 数。'
+  }
+
+  return Object.values(newLibraryFieldErrors.value).every((message) => !message)
+}
+
+function validateModelConfigForm() {
+  clearModelConfigFieldErrors()
+
+  if (!globalModelConfig.value.llmModel.trim()) {
+    modelConfigFieldErrors.value.llmModel = '请输入 LLM。'
+  }
+
+  if (!Number.isFinite(Number(globalModelConfig.value.llmContextLength)) || Number(globalModelConfig.value.llmContextLength) <= 0) {
+    modelConfigFieldErrors.value.llmContextLength = '请输入大于 0 的上下文长度。'
+  }
+
+  if (!globalModelConfig.value.apiKey.trim()) {
+    modelConfigFieldErrors.value.apiKey = '请输入 API_KEY。'
+  }
+
+  if (!Number.isFinite(Number(sessionModelConfig.value.recallChunks)) || Number(sessionModelConfig.value.recallChunks) <= 0) {
+    modelConfigFieldErrors.value.recallChunks = '请输入大于 0 的召回块数。'
+  }
+
+  if (!Number.isFinite(Number(sessionModelConfig.value.rerankChunks)) || Number(sessionModelConfig.value.rerankChunks) <= 0) {
+    modelConfigFieldErrors.value.rerankChunks = '请输入大于 0 的重排块数。'
+  }
+
+  if (
+    !modelConfigFieldErrors.value.recallChunks &&
+    !modelConfigFieldErrors.value.rerankChunks &&
+    Number(sessionModelConfig.value.rerankChunks) > Number(sessionModelConfig.value.recallChunks)
+  ) {
+    modelConfigFieldErrors.value.rerankChunks = '重排块数不能大于召回块数。'
+  }
+
+  return Object.values(modelConfigFieldErrors.value).every((message) => !message)
+}
+
+function closeLibraryPanel() {
+  if (creatingLibrary.value || configuringFolder.value || syncing.value) {
+    return
+  }
+
+  libraryPanelOpen.value = false
+}
+
+function selectLibraryFromPanel(libraryId: number) {
+  if (activeSessionId.value !== null && activeLibraryId.value !== libraryId) {
+    errorMessage.value = '当前会话已绑定文献库，如需切换请新建会话。'
+    return
+  }
+
+  applyLibrarySelection(libraryId)
+  statusMessage.value = '已选择当前文献库。'
+}
+
+async function configureLibraryEntry(libraryId: number) {
+  const previousLibraryId = activeLibraryId.value
+  applyLibrarySelection(libraryId)
+  await configureLibrary()
+
+  if (activeSessionId.value !== null && previousLibraryId !== null) {
+    applyLibrarySelection(previousLibraryId)
+  }
+}
+
+async function syncLibraryEntry(libraryId: number) {
+  const previousLibraryId = activeLibraryId.value
+  const targetLibrary = libraries.value.find((library) => library.id === libraryId) ?? null
+  if (targetLibrary?.folder_path) {
+    configuredFolderPath.value = targetLibrary.folder_path
+  }
+
+  applyLibrarySelection(libraryId)
+  await syncLibraryInBackground()
+
+  if (activeSessionId.value !== null && previousLibraryId !== null) {
+    applyLibrarySelection(previousLibraryId)
+  }
+}
+
+function openLibraryManagementPanel() {
+  clearFeedback()
+  closeSessionMenu()
+  libraryPanelTab.value = 'select'
+  panelSelectedLibraryId.value = activeLibraryId.value ?? libraries.value[0]?.id ?? null
+  libraryPanelOpen.value = true
+  void loadModelConfig(modelConfigLibraryId.value)
+}
+
+function switchLibraryPanelTab(tab: 'select' | 'create' | 'manage' | 'models') {
+  libraryPanelTab.value = tab
+  if (tab === 'create') {
+    clearNewLibraryFieldErrors()
+  }
+  if (tab === 'models') {
+    clearModelConfigFieldErrors()
+    void loadModelConfig(modelConfigLibraryId.value)
+  }
+}
+
+async function loadModelConfig(libraryId: number | null) {
+  loadingModelConfig.value = true
+  clearModelConfigFieldErrors()
+  try {
+    const querySuffix = libraryId !== null ? `?library_id=${libraryId}` : ''
+    const payload = await fetchJson<ModelConfigResponse>(`/api/model-config${querySuffix}`)
+    applyModelConfigPayload(payload.config)
+    modelConfigDraftStatus.value = ''
+  } catch (error) {
+    errorMessage.value = extractErrorMessage(error, '读取模型配置失败。')
+  } finally {
+    loadingModelConfig.value = false
+  }
+}
+
+
+function resetModelConfigDraft() {
+  clearModelConfigFieldErrors()
+  globalModelConfig.value = {
+    llmModel: 'qwen3-max',
+    embeddingModel: 'text-embedding-v1',
+    apiKey: '',
+    llmContextLength: 200000,
+    embeddingMaxInputTokens: 2048,
+  }
+  libraryModelConfig.value = {
+    chunkMode: 'recursive',
+  }
+  sessionModelConfig.value = {
+    recallChunks: 20,
+    rerankChunks: 5,
+  }
+  modelConfigDraftStatus.value = ''
+}
+
+async function saveModelConfig() {
+  if (!validateModelConfigForm()) {
+    clearFeedback()
+    errorMessage.value = '请完善模型配置中的必填字段。'
+    return
+  }
+
+  savingModelConfig.value = true
+  clearFeedback()
+  try {
+    const payload = await patchJson<ModelConfigResponse>('/api/model-config', {
+      library_id: modelConfigLibraryId.value,
+      global_config: {
+        llm_model: globalModelConfig.value.llmModel,
+        embedding_model: globalModelConfig.value.embeddingModel,
+        api_key: globalModelConfig.value.apiKey,
+        llm_context_length: globalModelConfig.value.llmContextLength,
+        embedding_max_input_tokens: globalModelConfig.value.embeddingMaxInputTokens,
+      },
+      library_config:
+        modelConfigLibraryId.value !== null
+          ? {
+              chunk_mode: libraryModelConfig.value.chunkMode,
+            }
+          : null,
+      session_config: {
+        recall_chunks: sessionModelConfig.value.recallChunks,
+        rerank_chunks: sessionModelConfig.value.rerankChunks,
+      },
+    })
+    applyModelConfigPayload(payload.config)
+    modelConfigDraftStatus.value =
+      payload.config.library.chunk_mode === 'semantic'
+        ? '配置已保存。当前语义分块仅保存为配置项，运行时仍会回退到递归分割。'
+        : '配置已保存。'
+  } catch (error) {
+    errorMessage.value = extractErrorMessage(error, '保存模型配置失败。')
+  } finally {
+    savingModelConfig.value = false
+  }
+}
+
+function applyModelConfigPayload(payload: ModelConfigResponsePayload) {
+  clearModelConfigFieldErrors()
+  globalModelConfig.value = {
+    llmModel: payload.global.llm_model,
+    embeddingModel: payload.global.embedding_model,
+    apiKey: payload.global.api_key,
+    llmContextLength: payload.global.llm_context_length,
+    embeddingMaxInputTokens: payload.global.embedding_max_input_tokens,
+  }
+  libraryModelConfig.value = {
+    chunkMode: payload.library.chunk_mode,
+  }
+  sessionModelConfig.value = {
+    recallChunks: payload.session.recall_chunks,
+    rerankChunks: payload.session.rerank_chunks,
+  }
+}
+
+async function chooseFolderForNewLibrary() {
+  if (!window.electronAPI) {
+    errorMessage.value = '当前环境不支持本地文件夹选择。'
+    return
+  }
+
+  clearFeedback()
+  const selectedPath = await window.electronAPI.selectPaperFolder()
+  if (!selectedPath) {
+    return
+  }
+
+  newLibraryFolderPath.value = selectedPath
+  newLibraryFieldErrors.value.folderPath = ''
+}
+
+function useSelectedLibraryForChat() {
+  const libraryId = panelSelectedLibraryId.value
+  if (libraryId === null) {
+    errorMessage.value = '请先选择一个文献库。'
+    return
+  }
+
+  const switchingSessionLibrary = activeSessionId.value !== null && activeLibraryId.value !== libraryId
+  if (switchingSessionLibrary) {
+    activeSessionId.value = null
+    messages.value = []
+    currentGoal.value = ''
+    activeReferenceKey.value = null
+  }
+
+  applyLibrarySelection(libraryId)
+  libraryPanelOpen.value = false
+  statusMessage.value = switchingSessionLibrary
+    ? '已切换文献库，下一条消息将创建新会话。'
+    : '已选择当前文献库。'
+}
+
+async function createLibraryWithFolder() {
+  if (!validateNewLibraryForm()) {
+    clearFeedback()
+    errorMessage.value = '请完善新建文献库中的必填字段。'
+    return
+  }
+
+  const libraryName = newLibraryName.value.trim()
+
+  creatingLibrary.value = true
+  clearFeedback()
+  try {
+    const response = await fetch(`${API_BASE_URL}/api/libraries`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        name: libraryName,
+        folder_path: newLibraryFolderPath.value || undefined,
+        embedding_model: newLibraryIndexConfig.value.embeddingModel.trim(),
+        embedding_max_input_tokens: Number(newLibraryIndexConfig.value.embeddingMaxInputTokens),
+        chunk_mode: newLibraryIndexConfig.value.chunkMode,
+      }),
+    })
+
+    const payload = await response.json().catch(() => ({}))
+    if (!response.ok) {
+      throw new Error(payload.detail || payload.message || '创建文献库失败，请稍后再试。')
+    }
+
+    newLibraryName.value = ''
+    newLibraryFolderPath.value = ''
+    newLibraryDescription.value = ''
+    newLibraryIndexConfig.value = {
+      embeddingModel: 'text-embedding-v1',
+      embeddingMaxInputTokens: 2048,
+      chunkMode: 'recursive',
+    }
+    clearNewLibraryFieldErrors()
+    statusMessage.value = payload.message || '文献库已创建。'
+    await refreshLibraries()
+
+    const createdLibraryId = payload.library?.id ?? null
+    if (createdLibraryId !== null) {
+      panelSelectedLibraryId.value = createdLibraryId
+      applyLibrarySelection(createdLibraryId)
+    }
+    libraryPanelOpen.value = false
+    if (createdLibraryId !== null) {
+      await syncLibraryInBackground()
+    }
+  } catch (error) {
+    errorMessage.value = error instanceof Error ? error.message : '创建文献库时发生未知错误。'
+  } finally {
+    creatingLibrary.value = false
+  }
+}
 
 onMounted(async () => {
   document.addEventListener('pointerdown', handleDocumentPointerDown)
-  await Promise.all([bootstrapSessions(), bootstrapFolderConfig()])
+  await bootstrapLibraries()
+  await loadModelConfig(modelConfigLibraryId.value)
+  await bootstrapSessions()
   isBootstrapping.value = false
 })
 
 onBeforeUnmount(() => {
+  syncJobPollToken += 1
   document.removeEventListener('pointerdown', handleDocumentPointerDown)
 })
 
-watch(
-  messages,
-  async () => {
-    await scrollMessageStreamToLatestQuestion()
-  },
-  { deep: true },
-)
+async function bootstrapLibraries() {
+  try {
+    await refreshLibraries()
+  } catch (error) {
+    errorMessage.value = extractErrorMessage(error, '无法读取文献库列表。')
+  }
+}
 
 async function bootstrapSessions() {
   try {
@@ -178,46 +813,95 @@ async function bootstrapSessions() {
     const firstSession = sessions.value[0]
     if (firstSession) {
       await openSession(firstSession.id)
+    } else {
+      syncActiveLibrarySelection()
     }
   } catch (error) {
     errorMessage.value = extractErrorMessage(error, '无法连接后端会话服务。')
   }
 }
 
-async function bootstrapFolderConfig() {
-  if (window.electronAPI) {
-    const storedPath = await window.electronAPI.getConfiguredPaperFolder()
-    if (storedPath) {
-      configuredFolderPath.value = storedPath
-    }
-  }
-  await refreshConfiguredFolderFromBackend()
-}
-
 async function refreshSessions() {
   const payload = await fetchJson<SessionsResponse>('/api/sessions')
   sessions.value = payload.sessions
+  syncActiveLibrarySelection()
+}
+
+async function refreshLibraries() {
+  const payload = await fetchJson<LibrariesResponse>('/api/libraries')
+  libraries.value = payload.libraries
+  if (libraryPanelOpen.value) {
+    const selectedStillExists =
+      panelSelectedLibraryId.value !== null &&
+      libraries.value.some((item) => item.id === panelSelectedLibraryId.value)
+    if (!selectedStillExists) {
+      panelSelectedLibraryId.value = activeLibraryId.value ?? libraries.value[0]?.id ?? null
+    }
+  }
+  syncActiveLibrarySelection()
+}
+
+function syncActiveLibrarySelection() {
+  if (activeSessionId.value !== null) {
+    const boundSession = sessions.value.find((item) => item.id === activeSessionId.value)
+    if (boundSession) {
+      applyLibrarySelection(boundSession.library_id)
+      return
+    }
+  }
+
+  if (activeLibraryId.value !== null) {
+    const stillExists = libraries.value.some((item) => item.id === activeLibraryId.value)
+    if (stillExists) {
+      applyLibrarySelection(activeLibraryId.value)
+      return
+    }
+  }
+
+  const firstLibrary = libraries.value[0]
+  if (firstLibrary) {
+    applyLibrarySelection(firstLibrary.id)
+    return
+  }
+
+  applyLibrarySelection(null)
+}
+
+function applyLibrarySelection(libraryId: number | null) {
+  activeLibraryId.value = libraryId
+  const library = libraries.value.find((item) => item.id === libraryId) ?? null
+  configuredFolderPath.value = library?.folder_path ?? ''
+  configuredFolderPdfCount.value = library?.document_count ?? null
 }
 
 async function openSession(sessionId: number) {
   clearFeedback()
   closeSessionMenu()
+  followMessageStreamToBottom.value = false
   activeSessionId.value = sessionId
   isLoadingMessages.value = true
+  let loaded = false
   try {
     const payload = await fetchJson<MessagesResponse>(`/api/sessions/${sessionId}/messages`)
     messages.value = payload.messages.map(mapMessageFromApi)
     const session = sessions.value.find((item) => item.id === sessionId)
     currentGoal.value = session?.user_goal ?? ''
+    applyLibrarySelection(session?.library_id ?? null)
+    loaded = true
   } catch (error) {
     errorMessage.value = extractErrorMessage(error, '读取会话消息失败。')
   } finally {
     isLoadingMessages.value = false
   }
+
+  if (loaded && activeSessionId.value === sessionId) {
+    await scrollMessageStreamToLatestQuestion()
+  }
 }
 
 function startNewSession() {
   closeSessionMenu()
+  followMessageStreamToBottom.value = false
   activeSessionId.value = null
   currentGoal.value = ''
   messages.value = []
@@ -261,6 +945,180 @@ function closeDeleteDialog() {
     return
   }
   deleteConfirmSessionId.value = null
+}
+
+function openDeleteLibraryDialog(libraryId: number) {
+  deleteConfirmLibraryId.value = libraryId
+}
+
+function closeDeleteLibraryDialog() {
+  if (deletingLibraryId.value !== null) {
+    return
+  }
+  deleteConfirmLibraryId.value = null
+}
+
+async function confirmDeleteLibrary() {
+  if (deleteConfirmLibraryId.value === null || deletingLibraryId.value !== null) {
+    return
+  }
+
+  const targetLibraryId = deleteConfirmLibraryId.value
+  deletingLibraryId.value = targetLibraryId
+  clearFeedback()
+  try {
+    const response = await fetch(`${API_BASE_URL}/api/libraries/${targetLibraryId}`, {
+      method: 'DELETE',
+    })
+    const payload = await response.json().catch(() => ({}))
+    if (!response.ok) {
+      throw new Error(payload.detail || payload.message || '删除文献库失败。')
+    }
+
+    if (activeLibraryId.value === targetLibraryId || activeSyncJobId.value !== null) {
+      syncJobPollToken += 1
+      syncing.value = false
+      activeSyncJobId.value = null
+      clearSyncFeedback()
+    }
+
+    deleteConfirmLibraryId.value = null
+    statusMessage.value = '文献库已删除。'
+    await refreshLibraries()
+
+    if (activeLibraryId.value === targetLibraryId) {
+      applyLibrarySelection(libraries.value[0]?.id ?? null)
+    }
+    if (panelSelectedLibraryId.value === targetLibraryId) {
+      panelSelectedLibraryId.value = libraries.value[0]?.id ?? null
+    }
+    if (viewingLibraryId.value === targetLibraryId) {
+      viewingLibraryId.value = null
+      libraryDetails.value = null
+    }
+  } catch (error) {
+    errorMessage.value = error instanceof Error ? error.message : '删除文献库失败。'
+  } finally {
+    deletingLibraryId.value = null
+  }
+}
+
+function formatDateTime(value: string) {
+  const date = new Date(value)
+  if (Number.isNaN(date.getTime())) {
+    return value || '--'
+  }
+
+  return new Intl.DateTimeFormat('zh-CN', {
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+  }).format(date)
+}
+
+async function openLibraryDetailsDialog(libraryId: number) {
+  viewingLibraryId.value = libraryId
+  loadingLibraryDetails.value = true
+  libraryDetails.value = null
+  viewingLibraryDocumentId.value = null
+  libraryDocumentDetails.value = null
+  libraryDocumentMetadataError.value = ''
+  clearFeedback()
+  try {
+    libraryDetails.value = await fetchJson<LibraryDetailsResponse>(`/api/libraries/${libraryId}/documents`)
+  } catch (error) {
+    errorMessage.value = error instanceof Error ? error.message : '读取文献库详情失败。'
+    viewingLibraryId.value = null
+  } finally {
+    loadingLibraryDetails.value = false
+  }
+}
+
+function closeLibraryDetailsDialog() {
+  if (loadingLibraryDetails.value || deletingLibraryDocumentId.value !== null) {
+    return
+  }
+
+  viewingLibraryId.value = null
+  libraryDetails.value = null
+  closeLibraryDocumentMetadataDialog()
+}
+
+async function deleteLibraryDocument(documentId: number, documentTitle: string) {
+  if (viewingLibraryId.value === null || deletingLibraryDocumentId.value !== null) {
+    return
+  }
+
+  const confirmed = window.confirm(`确认删除文献“${documentTitle}”吗？删除后将同时移除数据库记录和向量索引。`)
+  if (!confirmed) {
+    return
+  }
+
+  deletingLibraryDocumentId.value = documentId
+  clearFeedback()
+  try {
+    await deleteJson(`/api/libraries/${viewingLibraryId.value}/documents/${documentId}`)
+    statusMessage.value = '文献已删除。'
+    await refreshLibraries()
+    applyLibrarySelection(activeLibraryId.value)
+    if (libraryDocumentDetails.value?.id === documentId) {
+      closeLibraryDocumentMetadataDialog()
+    }
+    libraryDetails.value = await fetchJson<LibraryDetailsResponse>(`/api/libraries/${viewingLibraryId.value}/documents`)
+  } catch (error) {
+    errorMessage.value = extractErrorMessage(error, '删除文献失败。')
+  } finally {
+    deletingLibraryDocumentId.value = null
+  }
+}
+
+async function openLibraryDocumentMetadata(libraryId: number, documentId: number) {
+  viewingLibraryDocumentId.value = documentId
+  loadingLibraryDocumentMetadata.value = true
+  libraryDocumentDetails.value = null
+  libraryDocumentMetadataError.value = ''
+  clearFeedback()
+  try {
+    libraryDocumentDetails.value = await fetchJson<LibraryDocumentDetails>(
+      `/api/libraries/${libraryId}/documents/${documentId}`,
+    )
+  } catch (error) {
+    libraryDocumentMetadataError.value = extractErrorMessage(error, '读取文献元数据失败。')
+  } finally {
+    loadingLibraryDocumentMetadata.value = false
+  }
+}
+
+function closeLibraryDocumentMetadataDialog() {
+  if (loadingLibraryDocumentMetadata.value) {
+    return
+  }
+
+  viewingLibraryDocumentId.value = null
+  libraryDocumentDetails.value = null
+  libraryDocumentMetadataError.value = ''
+}
+
+async function toggleLibraryDocumentMetadata(documentId: number) {
+  if (viewingLibraryId.value === null || loadingLibraryDocumentMetadata.value) {
+    return
+  }
+
+  if (viewingLibraryDocumentId.value === documentId) {
+    closeLibraryDocumentMetadataDialog()
+    return
+  }
+
+  viewingLibraryDocumentId.value = documentId
+  libraryDocumentDetails.value = null
+  libraryDocumentMetadataError.value = ''
+  await openLibraryDocumentMetadata(viewingLibraryId.value, documentId)
+}
+
+function isLibraryDocumentExpanded(documentId: number) {
+  return viewingLibraryDocumentId.value === documentId
 }
 
 async function saveSessionTitle() {
@@ -425,13 +1283,19 @@ async function confirmDeleteSession() {
   }
 }
 
-function usePrompt(prompt: string) {
-  inputValue.value = prompt
+function usePrompt(prompt: PromptTemplateCard | string) {
+  inputValue.value = typeof prompt === 'string' ? prompt : prompt.template
 }
 
 async function sendMessage() {
   const text = inputValue.value.trim()
   if (!text || isSending.value) {
+    return
+  }
+
+  if (activeLibraryId.value === null) {
+    clearFeedback()
+    errorMessage.value = '请先配置文献库。'
     return
   }
 
@@ -446,6 +1310,7 @@ async function sendMessage() {
     createdAt: new Date().toISOString(),
     retrievedDocuments: [],
     retrievedMemories: [],
+    citations: [],
   }
   const streamingAssistantMessage: UiMessage = {
     id: Date.now() + 1,
@@ -455,6 +1320,7 @@ async function sendMessage() {
     createdAt: new Date().toISOString(),
     retrievedDocuments: [],
     retrievedMemories: [],
+    citations: [],
   }
 
   messages.value.push(optimisticUserMessage)
@@ -462,6 +1328,8 @@ async function sendMessage() {
   const reactiveUserMessage = messages.value[messages.value.length - 2]
   const reactiveAssistantMessage = messages.value[messages.value.length - 1]
   inputValue.value = ''
+  followMessageStreamToBottom.value = true
+  await scrollMessageStreamToBottom()
 
   try {
     const sessionId = await ensureActiveSession(text)
@@ -480,6 +1348,7 @@ async function sendMessage() {
     errorMessage.value = extractErrorMessage(error, '发送消息失败。')
   } finally {
     isSending.value = false
+    followMessageStreamToBottom.value = false
   }
 }
 
@@ -499,6 +1368,7 @@ async function runDebugStreamProbe() {
     createdAt: new Date().toISOString(),
     retrievedDocuments: [],
     retrievedMemories: [],
+    citations: [],
   }
   const debugAssistantMessage: UiMessage = {
     id: Date.now() + 1,
@@ -508,6 +1378,7 @@ async function runDebugStreamProbe() {
     createdAt: new Date().toISOString(),
     retrievedDocuments: [],
     retrievedMemories: [],
+    citations: [],
   }
 
   messages.value.push(debugUserMessage)
@@ -539,14 +1410,20 @@ async function ensureActiveSession(seedText: string) {
     return activeSessionId.value
   }
 
+  if (activeLibraryId.value === null) {
+    throw new Error('请先配置文献库。')
+  }
+
   const title = buildSessionTitle(seedText)
   const payload = await postJson<{ success: boolean; session: SessionSummary }>('/api/sessions', {
     title,
     user_goal: seedText,
+    library_id: activeLibraryId.value,
   })
 
   activeSessionId.value = payload.session.id
   currentGoal.value = payload.session.user_goal
+  applyLibrarySelection(payload.session.library_id)
   await refreshSessions()
   return payload.session.id
 }
@@ -559,7 +1436,7 @@ async function streamChatResponse(sessionId: number, userMessage: string, assist
     },
     body: JSON.stringify({
       message: userMessage,
-      top_k: 5,
+      top_k: sessionModelConfig.value.rerankChunks,
     }),
   })
 
@@ -632,6 +1509,16 @@ async function consumeSseResponse(response: Response, assistantMessage: UiMessag
 }
 
 function parseSseEvent(rawBlock: string): StreamEvent | null {
+  const payload = parseSsePayload(rawBlock)
+  return payload as StreamEvent | null
+}
+
+function parseSyncStreamEvent(rawBlock: string): any | null {
+  const payload = parseSsePayload(rawBlock)
+  return payload as SyncStreamEvent | null
+}
+
+function parseSsePayload(rawBlock: string): unknown | null {
   if (!rawBlock.trim()) {
     return null
   }
@@ -646,7 +1533,7 @@ function parseSseEvent(rawBlock: string): StreamEvent | null {
   }
 
   const jsonText = dataLine.replace(/^data:\s*/, '')
-  return JSON.parse(jsonText) as StreamEvent
+  return JSON.parse(jsonText)
 }
 
 async function applyStreamEvent(event: StreamEvent, assistantMessage: UiMessage) {
@@ -664,6 +1551,7 @@ async function applyStreamEvent(event: StreamEvent, assistantMessage: UiMessage)
 
   if (event.type === 'done') {
     assistantMessage.content = event.answer ?? assistantMessage.content
+    assistantMessage.citations = event.citations ?? []
     await flushStreamFrame()
     return
   }
@@ -678,7 +1566,9 @@ async function flushStreamFrame() {
   await new Promise<void>((resolve) => {
     requestAnimationFrame(() => resolve())
   })
-  await scrollMessageStreamToLatestQuestion()
+  if (followMessageStreamToBottom.value) {
+    scrollMessageStreamToBottomNow()
+  }
 }
 
 function buildSessionTitle(text: string) {
@@ -696,6 +1586,13 @@ async function handleFileChange(event: Event) {
 
   clearFeedback()
 
+  if (activeLibraryId.value === null) {
+    errorMessage.value = '请先配置文献库。'
+    input.value = ''
+    selectedFileNames.value = []
+    return
+  }
+
   if (files.length === 0) {
     selectedFileNames.value = []
     return
@@ -709,6 +1606,7 @@ async function handleFileChange(event: Event) {
     for (const file of files) {
       formData.append('files', file)
     }
+    formData.append('library_id', String(activeLibraryId.value))
 
     const response = await fetch(`${API_BASE_URL}/api/upload-papers`, {
       method: 'POST',
@@ -722,6 +1620,8 @@ async function handleFileChange(event: Event) {
 
     statusMessage.value = payload.message
     uploadedFiles.value = payload.saved_files ?? []
+    await refreshLibraries()
+    applyLibrarySelection(activeLibraryId.value)
   } catch (error) {
     errorMessage.value = extractErrorMessage(error, '上传失败')
   } finally {
@@ -730,7 +1630,13 @@ async function handleFileChange(event: Event) {
   }
 }
 
-async function configureLocalFolder() {
+function buildLibraryNameFromPath(folderPath: string) {
+  const normalized = folderPath.replace(/[\\/]+$/, '')
+  const segments = normalized.split(/[/\\]/).filter(Boolean)
+  return segments[segments.length - 1] || '我的文献库'
+}
+
+async function configureLibrary() {
   clearFeedback()
 
   if (!window.electronAPI) {
@@ -747,11 +1653,32 @@ async function configureLocalFolder() {
     }
 
     await window.electronAPI.setConfiguredPaperFolder(selectedPath)
-    configuredFolderPath.value = selectedPath
+    let targetLibraryId = activeLibraryId.value
 
-    const payload = await postFolderPath('/api/configure-local-folder', selectedPath)
-    configuredFolderPdfCount.value = payload.pdf_count ?? null
-    statusMessage.value = payload.message
+    if (targetLibraryId === null) {
+      const suggestedName = buildLibraryNameFromPath(selectedPath)
+      const libraryName = window.prompt('请输入文献库名称', suggestedName)?.trim()
+      if (!libraryName) {
+        return
+      }
+
+      const payload = await postJson<{ success: boolean; library: LibrarySummary }>('/api/libraries', {
+        name: libraryName,
+        folder_path: selectedPath,
+      })
+      targetLibraryId = payload.library.id
+      statusMessage.value = `已创建并配置文献库“${payload.library.name}”。`
+    } else {
+      const payload = await postJson<{ success: boolean; library: LibrarySummary; message: string; pdf_count?: number }>(
+        `/api/libraries/${targetLibraryId}/configure-folder`,
+        { folder_path: selectedPath },
+      )
+      configuredFolderPdfCount.value = payload.pdf_count ?? null
+      statusMessage.value = payload.message
+    }
+
+    await refreshLibraries()
+    applyLibrarySelection(targetLibraryId)
   } catch (error) {
     errorMessage.value = extractErrorMessage(error, '配置本地文件夹失败。')
   } finally {
@@ -759,8 +1686,14 @@ async function configureLocalFolder() {
   }
 }
 
-async function syncConfiguredFolder() {
+async function syncLibraryInBackground() {
   clearFeedback()
+  clearSyncFeedback()
+
+  if (activeLibraryId.value === null) {
+    errorMessage.value = '请先配置文献库。'
+    return
+  }
 
   const folderPath =
     configuredFolderPath.value || (window.electronAPI ? await window.electronAPI.getConfiguredPaperFolder() : '')
@@ -771,42 +1704,104 @@ async function syncConfiguredFolder() {
   }
 
   syncing.value = true
-  try {
-    const payload = await postFolderPath('/api/sync-configured-folder', folderPath)
-    configuredFolderPath.value = payload.paper_folder
-    if (window.electronAPI) {
-      await window.electronAPI.setConfiguredPaperFolder(payload.paper_folder)
-    }
+  activeSyncJobId.value = null
+  syncStatusMessageIsError.value = false
+  syncStatusMessage.value = activeLibraryName.value
+    ? `正在同步文献库“${activeLibraryName.value}”...`
+    : '正在同步文献库...'
 
-    const detailParts = [
-      payload.message,
-      payload.new_count !== undefined ? `新增 ${payload.new_count} 篇` : '',
-      payload.skipped_count !== undefined ? `跳过 ${payload.skipped_count} 篇` : '',
-      payload.failed_count !== undefined ? `失败 ${payload.failed_count} 篇` : '',
-    ].filter(Boolean)
-    statusMessage.value = detailParts.join('，')
+  try {
+    const startPayload = await postJson<SyncJobStatusResponse>(
+      `/api/libraries/${activeLibraryId.value}/sync/start`,
+      { folder_path: folderPath || null },
+    )
+    activeSyncJobId.value = startPayload.job_id
+    updateSyncStatusMessage(startPayload)
+
+    const finalPayload = await pollSyncJobUntilFinished(startPayload.job_id)
+    configuredFolderPath.value = finalPayload.paper_folder
+    if (window.electronAPI && finalPayload.paper_folder) {
+      await window.electronAPI.setConfiguredPaperFolder(finalPayload.paper_folder)
+    }
+    await refreshLibraries()
+    applyLibrarySelection(activeLibraryId.value)
+    clearSyncFeedback()
+    statusMessageIsError.value = (finalPayload.failed_count ?? 0) > 0
+    statusMessage.value = buildSyncSummaryMessage(finalPayload)
   } catch (error) {
+    clearSyncFeedback()
     errorMessage.value = extractErrorMessage(error, '同步本地文献文件夹失败。')
   } finally {
     syncing.value = false
+    activeSyncJobId.value = null
   }
 }
 
-async function refreshConfiguredFolderFromBackend() {
-  try {
-    const response = await fetch(`${API_BASE_URL}/api/paper-folder`)
-    if (!response.ok) {
-      return
+function updateSyncStatusMessage(payload: SyncJobStatusResponse) {
+  if (payload.status !== 'running') {
+    return
+  }
+
+  if ((payload.total_count ?? 0) > 0 && payload.current_file_name) {
+    syncStatusMessage.value = `当前正在同步文件 ${payload.current_index ?? 0}/${payload.total_count ?? 0}：${payload.current_file_name}`
+    return
+  }
+
+  syncStatusMessage.value = activeLibraryName.value
+    ? `正在同步文献库“${activeLibraryName.value}”...`
+    : '正在同步文献库...'
+}
+
+async function pollSyncJobUntilFinished(jobId: number): Promise<SyncJobStatusResponse> {
+  const pollToken = ++syncJobPollToken
+
+  while (true) {
+    const payload = await fetchJson<SyncJobStatusResponse>(`/api/sync-jobs/${jobId}`)
+    if (pollToken !== syncJobPollToken) {
+      throw new Error('同步状态轮询已取消。')
     }
-    const payload = (await response.json()) as { paper_folder?: string }
-    configuredFolderPath.value = payload.paper_folder ?? configuredFolderPath.value
-  } catch {
-    // Ignore bootstrap errors when backend is not running yet.
+
+    if (payload.paper_folder) {
+      configuredFolderPath.value = payload.paper_folder
+    }
+    updateSyncStatusMessage(payload)
+
+    if (payload.status === 'running' || payload.is_running) {
+      await waitForSyncPoll(400)
+      continue
+    }
+
+    if (payload.status === 'finished') {
+      return payload
+    }
+
+    throw new Error(payload.error_message || '同步文献库失败。')
   }
 }
 
-async function postFolderPath(endpoint: string, folderPath: string): Promise<FolderSyncResponse> {
-  return postJson<FolderSyncResponse>(endpoint, { folder_path: folderPath })
+function waitForSyncPoll(delayMs: number) {
+  return new Promise<void>((resolve) => {
+    window.setTimeout(() => resolve(), delayMs)
+  })
+}
+
+
+function buildSyncSummaryMessage(payload: FolderSyncResponse) {
+  const summary = `本次同步结果：新增 ${payload.new_count ?? 0} 篇，跳过 ${payload.skipped_count ?? 0} 篇，失败 ${payload.failed_count ?? 0} 篇。`
+  const failureReasons = [
+    ...new Set(
+      (payload.results ?? [])
+        .filter((result) => result.status !== 'saved' && result.status !== 'duplicate')
+        .map((result) => (result.error || '').trim())
+        .filter(Boolean),
+    ),
+  ]
+
+  if (failureReasons.length === 0) {
+    return summary
+  }
+
+  return `${summary}\n失败原因：${failureReasons.join('\n')}`
 }
 
 async function fetchJson<T>(endpoint: string): Promise<T> {
@@ -861,18 +1856,22 @@ async function deleteJson(endpoint: string): Promise<void> {
 function mapMessageFromApi(message: SessionMessage): UiMessage {
   let retrievedDocuments: RetrievedDocument[] = []
   let retrievedMemories: RetrievedMemory[] = []
+  let citations: CitationBinding[] = []
 
   if (message.retrieval_context_json) {
     try {
       const context = JSON.parse(message.retrieval_context_json) as {
         documents?: RetrievedDocument[]
         memories?: RetrievedMemory[]
+        citations?: CitationBinding[]
       }
       retrievedDocuments = context.documents ?? []
       retrievedMemories = context.memories ?? []
+      citations = context.citations ?? []
     } catch {
       retrievedDocuments = []
       retrievedMemories = []
+      citations = []
     }
   }
 
@@ -884,6 +1883,7 @@ function mapMessageFromApi(message: SessionMessage): UiMessage {
     createdAt: message.created_at,
     retrievedDocuments,
     retrievedMemories,
+    citations,
   }
 }
 
@@ -893,7 +1893,13 @@ function extractErrorMessage(error: unknown, fallback: string) {
 
 function clearFeedback() {
   statusMessage.value = ''
+  statusMessageIsError.value = false
   errorMessage.value = ''
+}
+
+function clearSyncFeedback() {
+  syncStatusMessage.value = ''
+  syncStatusMessageIsError.value = false
 }
 
 function formatTime(value: string) {
@@ -938,11 +1944,20 @@ function getReferenceEntries(message: UiMessage) {
     return []
   }
 
+  if (message.citations.length > 0) {
+    return message.citations.map((citation) => ({
+      number: citation.number,
+      text: citation.text,
+      matchedDocument: citationBindingToDocument(citation),
+    }))
+  }
+
   const { references } = splitReferenceSection(content)
+  const uniqueDocuments = getUniqueRetrievedDocuments(message.retrievedDocuments)
   const entries = references.map((item) => ({
     number: item.number,
     text: item.text,
-    matchedDocument: matchReferenceToDocument(item.text, item.number, message.retrievedDocuments),
+    matchedDocument: matchReferenceToDocument(item.text, uniqueDocuments),
   }))
 
   if (entries.length > 0) {
@@ -953,9 +1968,9 @@ function getReferenceEntries(message: UiMessage) {
     return []
   }
 
-  return message.retrievedDocuments.map((document, index) => ({
+  return uniqueDocuments.map((document, index) => ({
     number: index + 1,
-    text: document.title,
+    text: document.citation_text_default || document.title,
     matchedDocument: document,
   }))
 }
@@ -1107,20 +2122,84 @@ function escapeHtml(text: string) {
     .replace(/'/g, '&#39;')
 }
 
-function matchReferenceToDocument(referenceText: string, referenceNumber: number, documents: RetrievedDocument[]) {
+function getUniqueRetrievedDocuments(documents: RetrievedDocument[]) {
+  const deduped = new Map<number, RetrievedDocument>()
+  for (const document of documents) {
+    if (!deduped.has(document.document_id)) {
+      deduped.set(document.document_id, document)
+    }
+  }
+  return [...deduped.values()]
+}
+
+function citationBindingToDocument(citation: CitationBinding): RetrievedDocument {
+  return {
+    document_id: citation.document_id,
+    source_id: citation.source_id,
+    title: citation.title,
+    abstract: citation.abstract,
+    file_path: citation.file_path,
+    authors: citation.authors,
+    year: citation.year,
+    venue: citation.venue,
+    doi: citation.doi,
+    url: citation.url,
+    citation_text_default: citation.citation_text_default || citation.text,
+    chunk_index: citation.chunk_index,
+    chunk_text: citation.chunk_text || '',
+  }
+}
+
+function matchReferenceToDocument(referenceText: string, documents: RetrievedDocument[]) {
   const normalizedReference = normalizeForMatch(referenceText)
-  const byTitle = documents.find((document) =>
-    normalizedReference.includes(normalizeForMatch(document.title)) ||
-    normalizeForMatch(document.title).includes(normalizedReference),
-  )
+  const normalizedReferenceDoi = normalizeDoi(referenceText)
+
+  if (normalizedReferenceDoi) {
+    const byDoi = documents.find((document) => normalizeDoi(document.doi || '') === normalizedReferenceDoi)
+    if (byDoi) {
+      return byDoi
+    }
+  }
+
+  const byCitationText = documents.find((document) => {
+    const citationText = normalizeForMatch(document.citation_text_default || '')
+    return citationText && (
+      normalizedReference.includes(citationText) ||
+      citationText.includes(normalizedReference)
+    )
+  })
+  if (byCitationText) {
+    return byCitationText
+  }
+
+  const byTitle = documents.find((document) => {
+    const normalizedTitle = normalizeForMatch(document.title)
+    return normalizedTitle && (
+      normalizedReference.includes(normalizedTitle) ||
+      normalizedTitle.includes(normalizedReference)
+    )
+  })
   if (byTitle) {
     return byTitle
   }
-  return documents[referenceNumber - 1] ?? null
+
+  return null
 }
 
 function normalizeForMatch(text: string) {
-  return (text || '').replace(/\s+/g, '').toLowerCase()
+  return (text || '')
+    .toLowerCase()
+    .replace(/\[[^\]]+\]/g, '')
+    .replace(/https?:\/\/[^\s]+/g, '')
+    .replace(/\s+/g, '')
+    .replace(/[.,;:!?()[\]{}"'`~@#$%^&*_+=<>/\\|，。；：！？（）【】《》“”‘’、-]/g, '')
+}
+
+function normalizeDoi(text: string) {
+  const match = (text || '')
+    .toLowerCase()
+    .match(/10\.\d{4,9}\/[-._;()/:a-z0-9]+/)
+  return match?.[0]?.replace(/[.,;:!?()[\]{}"'`]+$/g, '') || ''
 }
 
 async function scrollMessageStreamToLatestQuestion() {
@@ -1134,15 +2213,48 @@ async function scrollMessageStreamToLatestQuestion() {
   const lastUserMessage = userMessages[userMessages.length - 1]
 
   if (!lastUserMessage) {
-    container.scrollTop = container.scrollHeight
+    scrollMessageStreamToBottomNow()
     return
   }
 
-  const containerRect = container.getBoundingClientRect()
-  const messageRect = lastUserMessage.getBoundingClientRect()
   const topPadding = 12
-  const relativeTop = messageRect.top - containerRect.top + container.scrollTop
-  container.scrollTop = Math.max(relativeTop - topPadding, 0)
+  runProgrammaticMessageStreamScroll((streamContainer) => {
+    streamContainer.scrollTop = Math.max(lastUserMessage.offsetTop - topPadding, 0)
+  })
+}
+
+function runProgrammaticMessageStreamScroll(action: (container: HTMLElement) => void) {
+  const container = messageStreamRef.value
+  if (!container) {
+    return
+  }
+
+  suppressMessageStreamScroll = true
+  action(container)
+  requestAnimationFrame(() => {
+    suppressMessageStreamScroll = false
+  })
+}
+
+function scrollMessageStreamToBottomNow() {
+  runProgrammaticMessageStreamScroll((container) => {
+    container.scrollTop = container.scrollHeight
+  })
+}
+
+async function scrollMessageStreamToBottom() {
+  await nextTick()
+  scrollMessageStreamToBottomNow()
+}
+
+function handleMessageStreamScroll() {
+  if (suppressMessageStreamScroll) {
+    return
+  }
+
+  if (followMessageStreamToBottom.value) {
+    followMessageStreamToBottom.value = false
+  }
 }
 
 function handleContentClick(message: UiMessage, event: MouseEvent) {
@@ -1269,12 +2381,27 @@ function isReferenceExpanded(messageId: number, referenceNumber: number) {
       </div>
     </aside>
 
-    <main class="chat-stage" :class="{ 'with-history': historyOpen }">
+    <main
+      class="chat-stage"
+      :class="{
+        'with-history': historyOpen,
+        'chat-stage--home': isHomeView,
+        'chat-stage--session': !isHomeView,
+      }"
+    >
       <header class="topbar">
         <button class="history-toggle" type="button" @click="toggleHistory">
           <span class="history-toggle__icon" />
           <span>历史会话</span>
         </button>
+
+        <div class="topbar__folder">
+          <span class="topbar__folder-label">文献目录</span>
+          <strong class="topbar__folder-path">{{ configuredFolderPath || '暂未配置文献目录' }}</strong>
+          <span v-if="configuredFolderPdfCount !== null" class="topbar__folder-meta">
+            {{ configuredFolderPdfCount }} 篇 PDF
+          </span>
+        </div>
 
         <div class="brand-mark">
           <span class="brand-mark__dot" />
@@ -1282,29 +2409,32 @@ function isReferenceExpanded(messageId: number, referenceNumber: number) {
         </div>
       </header>
 
+      <div class="stage-layout">
+
       <section v-if="isHomeView" class="hero-panel">
         <div class="hero-copy">
           <p class="hero-kicker">RAG Paper Assistant</p>
           <h1>从本地文献库出发，进入真正可持续的论文助手工作流。</h1>
-          <p class="hero-description">
+          <!-- <p class="hero-description">
             发送第一条消息后会自动创建会话并切换到聊天页。新建会话则会回到当前首页，你可以重新选择提示词、上传文献或同步本地文献文件夹。
-          </p>
+          </p> -->
         </div>
 
         <div class="prompt-grid">
           <button
             v-for="prompt in quickPrompts"
-            :key="prompt"
+            :key="prompt.id"
             class="prompt-card"
             type="button"
             @click="usePrompt(prompt)"
           >
-            {{ prompt }}
+            <strong>{{ prompt.title }}</strong>
+            <span>{{ prompt.summary }}</span>
           </button>
         </div>
       </section>
 
-      <section class="chat-card" :class="{ 'chat-card--session': !isHomeView }">
+      <section class="chat-card" :class="{ 'chat-card--session': !isHomeView, 'chat-card--home': isHomeView }">
         <!-- <div class="utility-bar">
           <div class="desktop-badge" :class="{ 'desktop-badge--inactive': !desktopMode }">
             {{ desktopMode ? '已连接 Electron 桌面环境' : '当前为浏览器模式，不能直接选择真实本地文件夹' }}
@@ -1332,7 +2462,20 @@ function isReferenceExpanded(messageId: number, referenceNumber: number) {
           </div>
         </div>
 
-        <div v-if="statusMessage" class="status-box status-box--success">{{ statusMessage }}</div>
+        <div
+          v-if="syncing && syncStatusMessage && !isHomeView"
+          class="status-box status-box--sticky"
+          :class="syncStatusMessageIsError ? 'status-box--error' : 'status-box--success'"
+        >
+          {{ syncStatusMessage }}
+        </div>
+        <div
+          v-if="statusMessage && !syncing"
+          class="status-box"
+          :class="statusMessageIsError ? 'status-box--error' : 'status-box--success'"
+        >
+          {{ statusMessage }}
+        </div>
         <div v-if="errorMessage" class="status-box status-box--error">{{ errorMessage }}</div>
 
         <div v-if="selectedFileNames.length" class="attachment-strip">
@@ -1349,7 +2492,12 @@ function isReferenceExpanded(messageId: number, referenceNumber: number) {
           </div>
         </div>
 
-        <div ref="messageStreamRef" class="message-stream">
+        <div
+          v-if="!isHomeView || hasMessages || isLoadingMessages"
+          ref="messageStreamRef"
+          class="message-stream"
+          @scroll.passive="handleMessageStreamScroll"
+        >
           <div v-if="isLoadingMessages" class="empty-state">正在读取会话消息...</div>
 
           <template v-else-if="hasMessages">
@@ -1360,10 +2508,10 @@ function isReferenceExpanded(messageId: number, referenceNumber: number) {
               :class="[message.role === 'user' ? 'message-bubble--user' : 'message-bubble--assistant']"
               :data-message-role="message.role"
             >
-              <div class="message-bubble__meta">
-                <strong>{{ message.role === 'user' ? '你' : '论文助手' }}</strong>
-                <span>{{ formatTime(message.createdAt) }}</span>
-              </div>
+              <!-- <div class="message-bubble__meta">
+                <strong class="message-bubble__role">{{ message.role === 'user' ? '你' : '论文助手' }}</strong>
+                <span class="message-bubble__time">{{ formatTime(message.createdAt) }}</span>
+              </div> -->
 
               <div
                 class="message-bubble__content"
@@ -1385,24 +2533,13 @@ function isReferenceExpanded(messageId: number, referenceNumber: number) {
                       'reference-card--active':
                         activeReferenceKey === buildReferenceKey(message.id, reference.number),
                     }"
-                    @click="activateReference(message.id, reference.number)"
+                    @click="toggleReferenceExpand(message.id, reference.number)"
                   >
                     <div class="reference-card__meta">
                       <div class="reference-card__summary">
                         <strong>[{{ reference.number }}]</strong>
                         <span>{{ reference.text }}</span>
                       </div>
-                      <button
-                        class="reference-card__toggle"
-                        type="button"
-                        :aria-expanded="isReferenceExpanded(message.id, reference.number)"
-                        @click.stop="toggleReferenceExpand(message.id, reference.number)"
-                      >
-                        <span
-                          class="reference-card__chevron"
-                          :class="{ 'reference-card__chevron--open': isReferenceExpanded(message.id, reference.number) }"
-                        />
-                      </button>
                     </div>
                     <div
                       v-if="isReferenceExpanded(message.id, reference.number)"
@@ -1410,14 +2547,26 @@ function isReferenceExpanded(messageId: number, referenceNumber: number) {
                     >
                       <template v-if="reference.matchedDocument">
                         <p class="reference-card__title">{{ reference.matchedDocument.title }}</p>
+                        <!-- <p v-if="reference.matchedDocument.citation_text_default" class="reference-card__citation">
+                          {{ reference.matchedDocument.citation_text_default }}
+                        </p>
+                        <p v-if="reference.matchedDocument.authors?.length || reference.matchedDocument.year || reference.matchedDocument.venue" class="reference-card__meta-line">
+                          {{ reference.matchedDocument.authors?.join(', ') || '作者未知' }}
+                          <span v-if="reference.matchedDocument.year"> | {{ reference.matchedDocument.year }}</span>
+                          <span v-if="reference.matchedDocument.venue"> | {{ reference.matchedDocument.venue }}</span>
+                        </p>
+                        <p v-if="reference.matchedDocument.doi" class="reference-card__meta-line">
+                          DOI: {{ reference.matchedDocument.doi }}
+                        </p> -->
                         <p>{{ reference.matchedDocument.abstract }}</p>
                         <span class="reference-card__path">{{ reference.matchedDocument.file_path }}</span>
                         <!--调试检索到的文献片段-->
                         <!-- <span class="reference-card__snippet">{{ reference.matchedDocument.chunk_text }}</span> -->
                       </template>
-                      <!-- <template v-else>
+                      <template v-else>
+                        <p class="reference-card__title">未能在当前检索结果中精确匹配到对应文献详情</p>
                         <p>{{ reference.text }}</p>
-                      </template> -->
+                      </template>
                     </div>
                   </article>
                 </div>
@@ -1456,7 +2605,7 @@ function isReferenceExpanded(messageId: number, referenceNumber: number) {
             </article>
           </template>
 
-          <div v-else class="empty-state">
+          <div v-else-if="!isHomeView" class="empty-state">
             {{ isHomeView ? '这里会显示你的会话消息。先选择一个提示词，或直接输入研究问题开始。' : '当前会话还没有消息。' }}
           </div>
         </div>
@@ -1484,12 +2633,15 @@ function isReferenceExpanded(messageId: number, referenceNumber: number) {
               <button class="attach-button" type="button" :disabled="uploading" @click="openFilePicker">
                 {{ uploading ? '上传中...' : '上传附件' }}
               </button>
-              <button class="folder-button" type="button" :disabled="configuringFolder" @click="configureLocalFolder">
+              <button v-if="isHomeView" class="folder-button" type="button" :disabled="configuringFolder" @click="openLibraryManagementPanel">
+                <span class="action-button-label">{{ configuringFolder ? '配置中...' : '配置文献库' }}</span>
                 {{ configuringFolder ? '配置中...' : '配置文件夹' }}
               </button>
-              <button class="sync-button" type="button" :disabled="syncing || !configuredFolderPath" @click="syncConfiguredFolder">
+              <button v-if="!isHomeView" class="sync-button" type="button" :disabled="syncing || !activeLibraryId" @click="syncLibraryInBackground">
+                <span class="action-button-label">{{ syncing ? '同步中...' : '同步文献库' }}</span>
                 {{ syncing ? '同步中...' : '同步文件夹' }}
               </button>
+              <span v-if="activeLibraryName && !isHomeView" class="library-name-chip">{{ activeLibraryName }}</span>
               <!-- <button class="sync-button" type="button" :disabled="debugStreaming" @click="runDebugStreamProbe">
                 {{ debugStreaming ? '调试中...' : '调试流式' }}
               </button> -->
@@ -1501,6 +2653,7 @@ function isReferenceExpanded(messageId: number, referenceNumber: number) {
           </div>
         </div>
       </section>
+      </div>
     </main>
 
     <div v-if="renamingSessionId !== null" class="dialog-mask" @click.self="closeRenameDialog()">
@@ -1562,6 +2715,491 @@ function isReferenceExpanded(messageId: number, referenceNumber: number) {
           </button>
         </div>
       </div>
+    </div>
+  </div>
+  <div v-if="deleteConfirmLibrary !== null" class="dialog-mask dialog-mask--top" @click.self="closeDeleteLibraryDialog()">
+    <div class="dialog-card">
+      <div class="dialog-card__header">
+        <h3>确认删除文献库</h3>
+        <button class="dialog-card__close" type="button" aria-label="关闭" :disabled="deletingLibraryId !== null" @click="closeDeleteLibraryDialog()">×</button>
+      </div>
+      <p class="dialog-card__description">
+        将删除“{{ deleteConfirmLibrary.name }}”及其文献、向量索引和同步记录。若仍有会话正在使用该文献库，系统会阻止删除。
+      </p>
+      <div class="dialog-card__actions">
+        <button class="dialog-card__button dialog-card__button--ghost" type="button" :disabled="deletingLibraryId !== null" @click="closeDeleteLibraryDialog()">
+          取消
+        </button>
+        <button class="dialog-card__button dialog-card__button--danger" type="button" :disabled="deletingLibraryId !== null" @click="confirmDeleteLibrary()">
+          {{ deletingLibraryId !== null ? '删除中...' : '确认删除' }}
+        </button>
+      </div>
+    </div>
+  </div>
+  <div v-if="viewingLibraryId !== null" class="dialog-mask dialog-mask--top" @click.self="closeLibraryDetailsDialog()">
+    <div class="dialog-card library-details">
+      <div class="dialog-card__header">
+        <h3>文献库详情</h3>
+        <button class="dialog-card__close" type="button" aria-label="关闭" :disabled="loadingLibraryDetails" @click="closeLibraryDetailsDialog()">×</button>
+      </div>
+      <div v-if="libraryDetails" class="library-details__body">
+        <div class="library-details__meta">
+          <p><strong>名称：</strong>{{ libraryDetails.name }}</p>
+          <p><strong>文献数量：</strong>{{ libraryDetails.document_count }}</p>
+          <p><strong>文件夹：</strong>{{ libraryDetails.folder_path || '未配置文件夹' }}</p>
+          <p><strong>创建时间：</strong>{{ formatDateTime(libraryDetails.created_at) }}</p>
+          <p><strong>最近更新时间：</strong>{{ formatDateTime(libraryDetails.updated_at) }}</p>
+        </div>
+        <div class="library-details__documents">
+          <h4>文献列表</h4>
+          <div v-if="libraryDetails.documents.length" class="library-details__table-wrap">
+            <table class="library-details__table">
+              <thead>
+                <tr>
+                  <th>标题</th>
+                  <th>更新时间</th>
+                  <th>操作</th>
+                </tr>
+              </thead>
+              <tbody>
+                <template v-for="document in libraryDetails.documents" :key="document.id">
+                  <tr>
+                    <td>
+                      <button
+                        class="library-details__title-button"
+                        type="button"
+                        @click="toggleLibraryDocumentMetadata(document.id)"
+                      >
+                        {{ document.title }}
+                      </button>
+                    </td>
+                    <td>{{ formatDateTime(document.updated_at) }}</td>
+                    <td>
+                      <button
+                        class="library-panel__action library-panel__action--danger"
+                        type="button"
+                        :disabled="deletingLibraryDocumentId !== null"
+                        @click="deleteLibraryDocument(document.id, document.title)"
+                      >
+                        {{ deletingLibraryDocumentId === document.id ? '删除中...' : '删除' }}
+                      </button>
+                    </td>
+                  </tr>
+                  <tr v-if="isLibraryDocumentExpanded(document.id)" class="library-details__expand-row">
+                    <td colspan="3">
+                      <div v-if="libraryDocumentDetails" class="library-details__document-meta">
+                        <p><strong>标题：</strong>{{ libraryDocumentDetails.title }}</p>
+                        <p><strong>文件名：</strong>{{ libraryDocumentDetails.file_name }}</p>
+                        <p><strong>文件路径：</strong>{{ libraryDocumentDetails.file_path }}</p>
+                        <p><strong>作者：</strong>{{ libraryDocumentDetails.authors.length ? libraryDocumentDetails.authors.join('，') : '暂无' }}</p>
+                        <p><strong>关键词：</strong>{{ libraryDocumentDetails.keywords.length ? libraryDocumentDetails.keywords.join('，') : '暂无' }}</p>
+                        <p><strong>年份：</strong>{{ libraryDocumentDetails.year || '暂无' }}</p>
+                        <p><strong>来源：</strong>{{ libraryDocumentDetails.venue || '暂无' }}</p>
+                        <p><strong>DOI：</strong>{{ libraryDocumentDetails.doi || '暂无' }}</p>
+                        <p><strong>URL：</strong>{{ libraryDocumentDetails.url || '暂无' }}</p>
+                        <p><strong>引用格式：</strong>{{ libraryDocumentDetails.citation_text_default || '暂无' }}</p>
+                        <p><strong>摘要：</strong>{{ libraryDocumentDetails.abstract || '暂无摘要' }}</p>
+                      </div>
+                      <div v-else-if="libraryDocumentMetadataError" class="library-details__loading">
+                        {{ libraryDocumentMetadataError }}
+                      </div>
+                      <div v-else class="library-details__loading">
+                        {{ loadingLibraryDocumentMetadata ? '正在读取文献元数据...' : '暂无可显示的文献信息。' }}
+                      </div>
+                    </td>
+                  </tr>
+                </template>
+              </tbody>
+            </table>
+          </div>
+          <p v-else class="library-panel__empty">该文献库中还没有文献。</p>
+        </div>
+      </div>
+      <div v-else class="library-details__loading">
+        {{ loadingLibraryDetails ? '正在读取文献库详情...' : '暂无可显示的文献库信息。' }}
+      </div>
+    </div>
+  </div>
+  <div v-if="libraryPanelOpen" class="dialog-mask" @click.self="closeLibraryPanel">
+    <div class="dialog-card library-panel">
+      <div class="dialog-card__header">
+        <div>
+          <p class="dialog-card__eyebrow">Libraries</p>
+          <h3>文献库配置</h3>
+        </div>
+        <button class="dialog-card__close" type="button" :disabled="creatingLibrary || configuringFolder || syncing" @click="closeLibraryPanel">
+          ×
+        </button>
+        </div>
+
+      <div class="library-panel__tabs" role="tablist" aria-label="文献库面板选项">
+        <button
+          class="library-panel__tab"
+          :class="{ 'library-panel__tab--active': libraryPanelTab === 'select' }"
+          type="button"
+          @click="switchLibraryPanelTab('select')"
+        >
+          选择文献库
+        </button>
+        <button
+          class="library-panel__tab"
+          :class="{ 'library-panel__tab--active': libraryPanelTab === 'create' }"
+          type="button"
+          @click="switchLibraryPanelTab('create')"
+        >
+          新建文献库
+        </button>
+        <button
+          class="library-panel__tab"
+          :class="{ 'library-panel__tab--active': libraryPanelTab === 'manage' }"
+          type="button"
+          @click="switchLibraryPanelTab('manage')"
+        >
+          文献库管理
+        </button>
+        <button
+          class="library-panel__tab"
+          :class="{ 'library-panel__tab--active': libraryPanelTab === 'models' }"
+          type="button"
+          @click="switchLibraryPanelTab('models')"
+        >
+          模型配置
+        </button>
+      </div>
+
+      <section v-if="libraryPanelTab === 'select'" class="library-panel__section library-panel__section--select">
+        <div class="library-panel__section-head">
+          <div>
+            <h4>选择已有文献库</h4>
+            <p>从已有文献库中选择一个，作为当前或下一次会话使用的知识范围。</p>
+          </div>
+        </div>
+        <div class="library-panel__select-row">
+          <select v-model="panelSelectedLibraryId" class="library-panel__select">
+            <option :value="null" disabled>请选择文献库</option>
+            <option v-for="library in libraries" :key="library.id" :value="library.id">
+              {{ library.name }}
+            </option>
+          </select>
+          <button
+            class="dialog-card__button dialog-card__button--primary"
+            type="button"
+            :disabled="panelSelectedLibraryId === null"
+            @click="useSelectedLibraryForChat"
+          >
+            {{ activeSessionId !== null ? '用于新会话' : '使用该文献库' }}
+          </button>
+        </div>
+        <p v-if="panelSelectedLibrary" class="library-panel__path">
+          {{ panelSelectedLibrary.folder_path || '当前文献库尚未配置文件夹。' }}
+        </p>
+        <div v-if="panelSelectedLibrary" class="library-panel__actions">
+          <button class="library-panel__action" type="button" :disabled="configuringFolder" @click="configureLibraryEntry(panelSelectedLibrary.id)">
+            {{ configuringFolder && activeLibraryId === panelSelectedLibrary.id ? '配置中...' : '配置文件夹' }}
+          </button>
+          <button
+            class="library-panel__action"
+            type="button"
+            :disabled="syncing || !panelSelectedLibrary.folder_path"
+            @click="syncLibraryEntry(panelSelectedLibrary.id)"
+          >
+            {{ syncing && activeLibraryId === panelSelectedLibrary.id ? '同步中...' : '同步文献库' }}
+          </button>
+        </div>
+        <div v-if="!libraries.length" class="library-panel__empty">
+          <p>还没有文献库，先在下面新建一个吧。</p>
+        </div>
+      </section>
+
+      <section v-if="libraryPanelTab === 'create'" class="library-panel__section">
+        <div class="library-panel__section-head">
+          <div>
+            <h4>新建文献库</h4>
+            <p>输入文献库名称，并按需为它配置本地文件夹。</p>
+          </div>
+        </div>
+        <div class="library-panel__create">
+          <label class="library-panel__field" :class="{ 'library-panel__field--error': !!newLibraryFieldErrors.name }">
+            <span>文献库名称</span>
+            <input
+              v-model="newLibraryName"
+              type="text"
+              maxlength="60"
+              placeholder="例如：RAG 综述库"
+              @input="newLibraryFieldErrors.name = ''"
+            />
+            <small v-if="newLibraryFieldErrors.name" class="library-panel__field-error">{{ newLibraryFieldErrors.name }}</small>
+          </label>
+          <label class="library-panel__field" :class="{ 'library-panel__field--error': !!newLibraryFieldErrors.folderPath }">
+            <span>文献文件夹</span>
+            <div class="library-panel__folder-picker">
+              <input :value="newLibraryFolderPath || '暂未选择文件夹'" type="text" readonly />
+              <button class="library-panel__action" type="button" @click="chooseFolderForNewLibrary">选择文件夹</button>
+            </div>
+            <small v-if="newLibraryFieldErrors.folderPath" class="library-panel__field-error">{{ newLibraryFieldErrors.folderPath }}</small>
+          </label>
+          <div class="library-panel__subsection">
+            <div class="library-panel__subsection-head">
+              <h5>索引预设</h5>
+              <p>这些参数用于描述新文献库计划采用的向量化与分块方式。</p>
+            </div>
+            <div class="model-config-fields">
+              <label class="library-panel__field" :class="{ 'library-panel__field--error': !!newLibraryFieldErrors.embeddingModel }">
+                <span>向量模型</span>
+                <input
+                  v-model="newLibraryIndexConfig.embeddingModel"
+                  type="text"
+                  list="embedding-model-suggestions"
+                  placeholder="例如：text-embedding-v1"
+                  @input="newLibraryFieldErrors.embeddingModel = ''"
+                />
+                <small v-if="newLibraryFieldErrors.embeddingModel" class="library-panel__field-error">{{ newLibraryFieldErrors.embeddingModel }}</small>
+              </label>
+              <label class="library-panel__field" :class="{ 'library-panel__field--error': !!newLibraryFieldErrors.embeddingMaxInputTokens }">
+                <span>向量模型最大单次输入 Token 数</span>
+                <input
+                  v-model.number="newLibraryIndexConfig.embeddingMaxInputTokens"
+                  type="number"
+                  min="1"
+                  step="128"
+                  placeholder="2048"
+                  @input="newLibraryFieldErrors.embeddingMaxInputTokens = ''"
+                />
+                <small v-if="newLibraryFieldErrors.embeddingMaxInputTokens" class="library-panel__field-error">{{ newLibraryFieldErrors.embeddingMaxInputTokens }}</small>
+              </label>
+              <div class="library-panel__field model-config-field--full">
+                <span>分块模式</span>
+                <div class="model-config__chunk-toggle" :data-mode="newLibraryIndexConfig.chunkMode">
+                  <span class="model-config__chunk-thumb" aria-hidden="true" />
+                  <button
+                    class="model-config__chunk-option"
+                    :class="{ 'model-config__chunk-option--active': newLibraryIndexConfig.chunkMode === 'recursive' }"
+                    type="button"
+                    @click="newLibraryIndexConfig.chunkMode = 'recursive'"
+                  >
+                    递归分割
+                  </button>
+                  <button
+                    class="model-config__chunk-option"
+                    :class="{ 'model-config__chunk-option--active': newLibraryIndexConfig.chunkMode === 'semantic' }"
+                    type="button"
+                    @click="newLibraryIndexConfig.chunkMode = 'semantic'"
+                  >
+                    语义分块
+                  </button>
+                </div>
+                <small class="model-config__hint">
+                  当前先完成建库页预设展示，后端文献库级索引参数将在下一步接入。
+                </small>
+              </div>
+            </div>
+          </div>
+          <button class="dialog-card__button dialog-card__button--primary" type="button" :disabled="!canCreateLibrary" @click="createLibraryWithFolder">
+            {{ creatingLibrary ? '创建中...' : '新建文献库' }}
+          </button>
+        </div>
+      </section>
+
+      <section v-if="libraryPanelTab === 'manage'" class="library-panel__section">
+        <div class="library-panel__section-head">
+          <div>
+            <h4>文献库管理</h4>
+            <p>查看所有文献库，并支持查看详情或删除。</p>
+          </div>
+        </div>
+        <div v-if="librariesByCreatedAt.length" class="library-table-wrap">
+          <table class="library-table">
+            <thead>
+              <tr>
+                <th>名称</th>
+                <th>文献数量</th>
+                <th>最近更新时间</th>
+                <th>操作</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr v-for="library in librariesByCreatedAt" :key="library.id">
+                <td>{{ library.name }}</td>
+                <td>{{ library.document_count }}</td>
+                <td>{{ formatDateTime(library.updated_at) }}</td>
+                <td>
+                  <div class="library-table__actions">
+                    <button class="library-panel__action" type="button" @click="openLibraryDetailsDialog(library.id)">
+                      查看
+                    </button>
+                    <button class="library-panel__action library-panel__action--danger" type="button" @click="openDeleteLibraryDialog(library.id)">
+                      删除
+                    </button>
+                  </div>
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <div v-else class="library-panel__empty">
+          <p>暂无可管理的文献库，请先新建一个。</p>
+        </div>
+      </section>
+
+      <section v-if="libraryPanelTab === 'models'" class="library-panel__section library-panel__section--models">
+        <!-- <div class="library-panel__section-head">
+          <div>
+            <h4>模型配置</h4>
+          </div>
+        </div> -->
+
+        <div v-if="loadingModelConfig" class="library-panel__empty">
+          <p>正在读取模型配置...</p>
+        </div>
+
+        <div v-else class="model-config-grid">
+          <section class="model-config-card">
+            <div class="model-config-card__head">
+              <div>
+                <h5>全局配置</h5>
+                <p>影响整个应用的模型与密钥设置。</p>
+              </div>
+            </div>
+
+            <div class="model-config-fields">
+              <label class="library-panel__field" :class="{ 'library-panel__field--error': !!modelConfigFieldErrors.llmModel }">
+                <span>LLM</span>
+                <input
+                  v-model="globalModelConfig.llmModel"
+                  type="text"
+                  list="llm-model-suggestions"
+                  placeholder="例如：qwen3-max"
+                  @input="modelConfigFieldErrors.llmModel = ''"
+                />
+                <small v-if="modelConfigFieldErrors.llmModel" class="library-panel__field-error">{{ modelConfigFieldErrors.llmModel }}</small>
+              </label>
+
+              <label class="library-panel__field" :class="{ 'library-panel__field--error': !!modelConfigFieldErrors.llmContextLength }">
+                <span>上下文长度</span>
+                <input
+                  v-model.number="globalModelConfig.llmContextLength"
+                  type="number"
+                  min="1"
+                  step="1000"
+                  placeholder="200000"
+                  @input="modelConfigFieldErrors.llmContextLength = ''"
+                />
+                <small v-if="modelConfigFieldErrors.llmContextLength" class="library-panel__field-error">{{ modelConfigFieldErrors.llmContextLength }}</small>
+                <small class="model-config__hint">默认 200K，仅表示允许送入 LLM 的正文上下文上限。</small>
+              </label>
+
+              <label class="library-panel__field model-config-field--full" :class="{ 'library-panel__field--error': !!modelConfigFieldErrors.apiKey }">
+                <span>API_KEY</span>
+                <input
+                  v-model="globalModelConfig.apiKey"
+                  type="password"
+                  autocomplete="off"
+                  placeholder="请输入模型服务 API_KEY"
+                  @input="modelConfigFieldErrors.apiKey = ''"
+                />
+                <small v-if="modelConfigFieldErrors.apiKey" class="library-panel__field-error">{{ modelConfigFieldErrors.apiKey }}</small>
+              </label>
+            </div>
+          </section>
+
+          <section class="model-config-card">
+            <div class="model-config-card__head">
+              <div>
+                <h5>文献库配置</h5>
+                <p>当前将应用到：{{ modelConfigTargetLibraryName }}</p>
+              </div>
+            </div>
+
+            <div class="model-config-fields">
+              <div class="library-panel__field model-config-field--full">
+                <span>分块模式</span>
+                <div class="model-config__chunk-toggle" :data-mode="libraryModelConfig.chunkMode">
+                  <span class="model-config__chunk-thumb" aria-hidden="true" />
+                  <button
+                    class="model-config__chunk-option"
+                    :class="{ 'model-config__chunk-option--active': libraryModelConfig.chunkMode === 'recursive' }"
+                    type="button"
+                    @click="libraryModelConfig.chunkMode = 'recursive'"
+                  >
+                    递归分割
+                  </button>
+                  <button
+                    class="model-config__chunk-option"
+                    :class="{ 'model-config__chunk-option--active': libraryModelConfig.chunkMode === 'semantic' }"
+                    type="button"
+                    @click="libraryModelConfig.chunkMode = 'semantic'"
+                  >
+                    语义分块
+                  </button>
+                </div>
+                <small class="model-config__hint">
+                  递归分割更稳，语义分块更适合后续接入大模型结构识别。
+                </small>
+              </div>
+            </div>
+          </section>
+
+          <section class="model-config-card">
+            <div class="model-config-card__head">
+              <div>
+                <h5>会话配置</h5>
+                <p>控制检索与重排阶段的候选块规模。</p>
+              </div>
+            </div>
+
+            <div class="model-config-fields">
+              <label class="library-panel__field" :class="{ 'library-panel__field--error': !!modelConfigFieldErrors.recallChunks }">
+                <span>召回块数</span>
+                <input
+                  v-model.number="sessionModelConfig.recallChunks"
+                  type="number"
+                  min="1"
+                  step="1"
+                  placeholder="20"
+                  @input="modelConfigFieldErrors.recallChunks = ''"
+                />
+                <small v-if="modelConfigFieldErrors.recallChunks" class="library-panel__field-error">{{ modelConfigFieldErrors.recallChunks }}</small>
+                <small class="model-config__hint">向量检索阶段初次召回的候选 chunk 数。</small>
+              </label>
+
+              <label class="library-panel__field" :class="{ 'library-panel__field--error': !!modelConfigFieldErrors.rerankChunks }">
+                <span>重排块数</span>
+                <input
+                  v-model.number="sessionModelConfig.rerankChunks"
+                  type="number"
+                  min="1"
+                  step="1"
+                  placeholder="5"
+                  @input="modelConfigFieldErrors.rerankChunks = ''"
+                />
+                <small v-if="modelConfigFieldErrors.rerankChunks" class="library-panel__field-error">{{ modelConfigFieldErrors.rerankChunks }}</small>
+                <small class="model-config__hint">重排后真正送入回答生成阶段的 chunk 数。</small>
+              </label>
+            </div>
+          </section>
+        </div>
+
+        <div class="model-config-actions">
+          <div v-if="modelConfigDraftStatus" class="model-config-status">
+            {{ modelConfigDraftStatus }}
+          </div>
+          <div class="model-config-actions__buttons">
+            <button class="dialog-card__button dialog-card__button--ghost" type="button" :disabled="savingModelConfig" @click="resetModelConfigDraft">
+              恢复默认值
+            </button>
+            <button class="dialog-card__button dialog-card__button--primary" type="button" :disabled="savingModelConfig" @click="saveModelConfig">
+              保存配置
+            </button>
+          </div>
+        </div>
+
+        <datalist id="llm-model-suggestions">
+          <option v-for="item in llmModelSuggestions" :key="item" :value="item" />
+        </datalist>
+        <datalist id="embedding-model-suggestions">
+          <option v-for="item in embeddingModelSuggestions" :key="item" :value="item" />
+        </datalist>
+      </section>
     </div>
   </div>
 </template>
@@ -1795,6 +3433,10 @@ function isReferenceExpanded(messageId: number, referenceNumber: number) {
   backdrop-filter: blur(8px);
 }
 
+.dialog-mask--top {
+  z-index: 140;
+}
+
 .dialog-card {
   width: min(420px, 100%);
   display: grid;
@@ -2018,6 +3660,8 @@ function isReferenceExpanded(messageId: number, referenceNumber: number) {
 }
 
 .prompt-card {
+  display: grid;
+  gap: 0.45rem;
   padding: 1rem 1.1rem;
   border-radius: 20px;
   background: linear-gradient(180deg, #ffffff, #f5f7fb);
@@ -2027,6 +3671,18 @@ function isReferenceExpanded(messageId: number, referenceNumber: number) {
   transition:
     transform 0.18s ease,
     box-shadow 0.18s ease;
+}
+
+.prompt-card strong {
+  font-size: 1rem;
+  font-weight: 700;
+  color: #0f172a;
+}
+
+.prompt-card span {
+  color: #475569;
+  font-size: 0.92rem;
+  line-height: 1.6;
 }
 
 .prompt-card:hover {
@@ -2111,6 +3767,15 @@ function isReferenceExpanded(messageId: number, referenceNumber: number) {
 .status-box {
   padding: 0.9rem 1rem;
   border-radius: 16px;
+  white-space: pre-line;
+}
+
+.status-box--sticky {
+  position: sticky;
+  top: 0;
+  z-index: 6;
+  box-shadow: 0 8px 24px rgba(15, 23, 42, 0.08);
+  backdrop-filter: blur(12px);
 }
 
 .status-box--success {
@@ -2207,6 +3872,14 @@ function isReferenceExpanded(messageId: number, referenceNumber: number) {
   gap: 1rem;
   font-size: 0.82rem;
   opacity: 0.82;
+}
+
+.message-bubble__role {
+  font-weight: 600;
+}
+
+.message-bubble__time {
+  flex-shrink: 0;
 }
 
 .message-bubble__content {
@@ -2378,32 +4051,6 @@ function isReferenceExpanded(messageId: number, referenceNumber: number) {
   word-break: break-word;
 }
 
-.reference-card__toggle {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  flex-shrink: 0;
-  width: 2rem;
-  height: 2rem;
-  border: none;
-  border-radius: 999px;
-  background: rgba(37, 99, 235, 0.1);
-  cursor: pointer;
-}
-
-.reference-card__chevron {
-  width: 0.6rem;
-  height: 0.6rem;
-  border-right: 2px solid #1d4ed8;
-  border-bottom: 2px solid #1d4ed8;
-  transform: rotate(45deg) translateY(-1px);
-  transition: transform 0.18s ease;
-}
-
-.reference-card__chevron--open {
-  transform: rotate(-135deg) translateX(-1px);
-}
-
 .reference-card__details {
   display: grid;
   gap: 0.45rem;
@@ -2422,6 +4069,12 @@ function isReferenceExpanded(messageId: number, referenceNumber: number) {
   color: #0f172a;
 }
 
+.reference-card__citation,
+.reference-card__meta-line {
+  color: #475569;
+  font-size: 0.88rem;
+}
+
 .reference-card__path {
   color: #64748b;
   font-size: 0.86rem;
@@ -2436,15 +4089,6 @@ function isReferenceExpanded(messageId: number, referenceNumber: number) {
 .message-bubble--user .reference-card {
   border-color: rgba(255, 255, 255, 0.16);
   background: rgba(255, 255, 255, 0.12);
-}
-
-.message-bubble--user .reference-card__toggle {
-  background: rgba(255, 255, 255, 0.16);
-}
-
-.message-bubble--user .reference-card__chevron {
-  border-right-color: rgba(255, 255, 255, 0.92);
-  border-bottom-color: rgba(255, 255, 255, 0.92);
 }
 
 .message-bubble--user .reference-card__meta,
@@ -2542,6 +4186,26 @@ function isReferenceExpanded(messageId: number, referenceNumber: number) {
   border-radius: 999px;
 }
 
+.folder-button,
+.sync-button {
+  font-size: 0;
+}
+
+.action-button-label {
+  font-size: 0.94rem;
+  line-height: 1.1;
+}
+
+.library-name-chip {
+  display: inline-flex;
+  align-items: center;
+  padding: 0;
+  background: transparent;
+  color: #64748b;
+  font-size: 0.88rem;
+  white-space: nowrap;
+}
+
 .attach-button {
   background: rgba(37, 99, 235, 0.08);
   color: #1d4ed8;
@@ -2582,6 +4246,546 @@ function isReferenceExpanded(messageId: number, referenceNumber: number) {
 .new-session-button:hover,
 .history-item:hover {
   transform: translateY(-1px);
+}
+
+.chat-stage {
+  height: 100vh;
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  box-sizing: border-box;
+}
+
+.topbar {
+  width: 100%;
+  flex-shrink: 0;
+  max-width: 1080px;
+  margin: 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0.1rem 0;
+  border: none;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+  backdrop-filter: none;
+}
+
+.history-toggle,
+.brand-mark {
+  flex-shrink: 0;
+}
+
+.topbar__folder {
+  display: none !important;
+}
+
+.topbar__folder-label {
+  color: #64748b;
+  font-size: 0.72rem;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
+
+.topbar__folder-path {
+  overflow: hidden;
+  color: #111827;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 0.92rem;
+  font-weight: 600;
+}
+
+.topbar__folder-meta {
+  color: #64748b;
+  font-size: 0.74rem;
+}
+
+.stage-layout {
+  width: 100%;
+  max-width: 1080px;
+  margin: 0.9rem auto 0;
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  gap: 1rem;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.stage-layout > .hero-panel,
+.stage-layout > .chat-card {
+  width: 100%;
+  max-width: none;
+  margin: 0;
+}
+
+.chat-stage--home .stage-layout {
+  justify-content: center;
+  gap: 0.85rem;
+}
+
+.chat-stage--home .hero-panel {
+  flex-shrink: 0;
+  padding: 2rem 2.15rem;
+  border-color: rgba(255, 255, 255, 0.74);
+  background: rgba(255, 255, 255, 0.52);
+  box-shadow: 0 18px 42px rgba(15, 23, 42, 0.05);
+}
+
+.chat-stage--home .chat-card {
+  flex-shrink: 0;
+  padding: 0.95rem 1rem 1rem;
+  border-color: rgba(255, 255, 255, 0.72);
+  background: rgba(255, 255, 255, 0.48);
+  box-shadow: 0 18px 42px rgba(15, 23, 42, 0.05);
+}
+
+.chat-stage--home .hero-copy {
+  width: 100%;
+  max-width: 1020px;
+}
+
+.chat-stage--home .hero-kicker {
+  color: #94a3b8;
+  font-size: 0.74rem;
+  letter-spacing: 0.08em;
+}
+
+.chat-stage--home .hero-copy h1 {
+  font-size: clamp(1.85rem, 3vw, 2.75rem);
+  line-height: 1.12;
+  letter-spacing: -0.02em;
+}
+
+.chat-stage--home .hero-description {
+  margin-top: 0.85rem;
+  color: #64748b;
+  font-size: 0.98rem;
+  line-height: 1.72;
+}
+
+.chat-stage--home .prompt-grid {
+  /* width: 100%;
+  max-width: 720px; */
+  gap: 0.8rem;
+  margin-top: 1.45rem;
+}
+
+.chat-stage--home .prompt-card {
+  padding: 0.9rem 0.95rem;
+  border: 1px solid rgba(148, 163, 184, 0.16);
+  border-radius: 18px;
+  background: rgba(248, 250, 252, 0.62);
+  box-shadow: none;
+  color: #334155;
+}
+
+.chat-stage--home .prompt-card:hover {
+  transform: none;
+  border-color: rgba(59, 130, 246, 0.18);
+  box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.04);
+}
+
+.chat-stage--home .uploaded-list {
+  gap: 0.6rem;
+}
+
+.chat-stage--home .uploaded-item {
+  padding: 0.8rem 0.9rem;
+  border-radius: 16px;
+  background: rgba(248, 250, 252, 0.72);
+}
+
+.chat-stage--home .composer {
+  margin-top: 0.75rem;
+  padding: 0.82rem 0.85rem;
+  border-radius: 20px;
+  background: rgba(255, 255, 255, 0.8);
+  box-shadow: inset 0 0 0 1px rgba(148, 163, 184, 0.14);
+}
+
+.chat-stage--home .composer__input {
+  min-height: 86px;
+}
+
+.chat-stage--home .composer__actions {
+  padding-top: 0.68rem;
+}
+
+.chat-stage--home .attach-button,
+.chat-stage--home .folder-button,
+.chat-stage--home .sync-button {
+  padding: 0.68rem 0.92rem;
+}
+
+.chat-stage--home .send-button {
+  padding: 0.74rem 1.05rem;
+}
+
+.history-drawer {
+  background: rgba(247, 249, 252, 0.86);
+  border-right-color: rgba(148, 163, 184, 0.12);
+  box-shadow: 12px 0 34px rgba(15, 23, 42, 0.04);
+}
+
+.drawer-header {
+  margin-bottom: 0.85rem;
+}
+
+.drawer-kicker {
+  color: #94a3b8;
+  font-size: 0.74rem;
+  letter-spacing: 0.08em;
+}
+
+.drawer-header h2 {
+  font-size: 1.02rem;
+  font-weight: 600;
+}
+
+.new-session-button {
+  margin-bottom: 0.85rem;
+  background: rgba(255, 255, 255, 0.62);
+  box-shadow: inset 0 0 0 1px rgba(148, 163, 184, 0.14);
+}
+
+.history-list {
+  gap: 0.55rem;
+}
+
+.history-item {
+  padding: 0.25rem 0.3rem 0.25rem 0.45rem;
+  border: 1px solid rgba(148, 163, 184, 0.12);
+  border-radius: 13px;
+  background: rgba(255, 255, 255, 0.54);
+  box-shadow: none;
+}
+
+.history-item--active {
+  background: rgba(255, 255, 255, 0.82);
+  box-shadow: inset 0 0 0 1px rgba(37, 99, 235, 0.18);
+}
+
+.history-item__body {
+  padding: 0.42rem 0.3rem;
+}
+
+.history-item__body strong {
+  color: #334155;
+  font-weight: 500;
+  font-size: 0.94rem;
+}
+
+.history-item__pin {
+  padding: 0.12rem 0.35rem;
+  background: rgba(37, 99, 235, 0.08);
+  color: #3b82f6;
+  font-size: 0.68rem;
+}
+
+.history-menu-button {
+  width: 1.85rem;
+  height: 1.85rem;
+  color: #64748b;
+}
+
+.history-menu-button:hover:not(:disabled) {
+  background: rgba(226, 232, 240, 0.72);
+}
+
+.history-menu {
+  min-width: 8rem;
+  padding: 0.28rem;
+  border: 1px solid rgba(148, 163, 184, 0.12);
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.96);
+  box-shadow: 0 12px 26px rgba(15, 23, 42, 0.08);
+}
+
+.history-menu__item {
+  padding: 0.56rem 0.7rem;
+  border-radius: 9px;
+  color: #475569;
+  font-size: 0.9rem;
+}
+
+.history-menu__item:hover:not(:disabled) {
+  background: rgba(241, 245, 249, 0.78);
+}
+
+.history-menu__item--danger {
+  color: #dc2626;
+}
+
+.chat-stage--session .chat-card {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  min-height: 0;
+  overflow: hidden;
+  padding: 0.5rem 0.6rem 0.6rem;
+  border-color: rgba(255, 255, 255, 0.72);
+  background: rgba(255, 255, 255, 0.42);
+  box-shadow: 0 18px 42px rgba(15, 23, 42, 0.05);
+}
+
+.chat-stage--session .message-stream {
+  flex: 1;
+  min-height: 0;
+  max-height: none;
+  margin-top: 0.5rem;
+  padding: 0.4rem 0.35rem 0.9rem;
+  border-radius: 18px;
+  background: transparent;
+}
+
+.chat-stage--session .composer {
+  margin-top: 0.6rem;
+  flex-shrink: 0;
+  padding: 0.8rem 0.85rem;
+  border-radius: 20px;
+  background: rgba(255, 255, 255, 0.76);
+  box-shadow: inset 0 0 0 1px rgba(148, 163, 184, 0.14);
+}
+
+.chat-stage--session .message-bubble {
+  max-width: min(88%, 760px);
+  padding: 0.9rem 1rem 0.95rem;
+  border-radius: 22px;
+  box-shadow: none;
+}
+
+.chat-stage--session .message-bubble--assistant {
+  max-width: min(100%, 860px);
+  padding: 0.15rem 0.1rem 0.3rem;
+  background: transparent;
+}
+
+.chat-stage--session .message-bubble--user {
+  background: linear-gradient(180deg, rgba(240, 246, 255, 0.96), rgba(232, 240, 255, 0.92));
+  color: #0f172a;
+  box-shadow: inset 0 0 0 1px rgba(148, 163, 184, 0.16);
+}
+
+.chat-stage--session .message-bubble__meta {
+  opacity: 0.48;
+  font-size: 0.74rem;
+  letter-spacing: 0.01em;
+}
+
+.chat-stage--session .message-bubble--assistant .message-bubble__meta {
+  justify-content: flex-start;
+  gap: 0.5rem;
+  margin-bottom: 0.1rem;
+}
+
+.chat-stage--session .message-bubble--assistant .message-bubble__content {
+  color: #111827;
+  font-size: 0.98rem;
+  line-height: 1.9;
+}
+
+.chat-stage--session .message-bubble__role {
+  font-weight: 500;
+}
+
+.chat-stage--session .message-bubble__time {
+  font-size: 0.72rem;
+}
+
+.chat-stage--session .message-bubble--assistant .message-bubble__role {
+  color: #64748b;
+}
+
+.chat-stage--session .message-bubble--assistant .message-bubble__time {
+  color: #94a3b8;
+}
+
+.chat-stage--session .message-bubble--user .message-bubble__meta {
+  justify-content: flex-end;
+  gap: 0.45rem;
+}
+
+.chat-stage--session .message-bubble--user .message-bubble__role {
+  color: #475569;
+}
+
+.chat-stage--session .message-bubble--user .message-bubble__time {
+  color: #94a3b8;
+}
+
+.chat-stage--session .message-bubble--user .message-bubble__content :deep(code) {
+  background: rgba(15, 23, 42, 0.08);
+}
+
+.chat-stage--session .message-bubble--user .message-bubble__content :deep(a) {
+  color: #2563eb;
+}
+
+.chat-stage--session .message-bubble--user .message-bubble__content :deep(.citation-link) {
+  background: rgba(37, 99, 235, 0.12);
+  color: #1d4ed8;
+}
+
+.chat-stage--session .reference-card {
+  gap: 0.35rem;
+  padding: 0.78rem 0.85rem;
+  border-radius: 14px;
+  border-color: rgba(148, 163, 184, 0.16);
+  background: rgba(248, 250, 252, 0.58);
+  box-shadow: none;
+}
+
+.chat-stage--session .message-bubble--user .reference-card {
+  border-color: rgba(148, 163, 184, 0.16);
+  background: rgba(255, 255, 255, 0.52);
+}
+
+.chat-stage--session .reference-card:hover {
+  transform: none;
+  border-color: rgba(59, 130, 246, 0.22);
+}
+
+.chat-stage--session .reference-card--active {
+  border-color: rgba(37, 99, 235, 0.24);
+  box-shadow: 0 0 0 2px rgba(37, 99, 235, 0.05);
+}
+
+.chat-stage--session .reference-panel {
+  gap: 0.45rem;
+  margin-top: 0.1rem;
+}
+
+.chat-stage--session .reference-list {
+  gap: 0.5rem;
+}
+
+.chat-stage--session .reference-panel__header,
+.chat-stage--session .evidence-block__label {
+  color: #94a3b8;
+  font-size: 0.72rem;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.chat-stage--session .reference-card__meta {
+  gap: 0.65rem;
+}
+
+.chat-stage--session .reference-card__summary {
+  gap: 0.45rem;
+}
+
+.chat-stage--session .reference-card__summary strong {
+  color: #64748b;
+  font-weight: 600;
+}
+
+.chat-stage--session .reference-card__summary span {
+  color: #334155;
+  line-height: 1.65;
+}
+
+.chat-stage--session .reference-card__details {
+  gap: 0.35rem;
+  padding-top: 0.05rem;
+}
+
+.chat-stage--session .reference-card__title {
+  color: #1e293b;
+  font-size: 0.92rem;
+}
+
+.chat-stage--session .reference-card__citation,
+.chat-stage--session .reference-card__meta-line {
+  color: #64748b;
+  font-size: 0.85rem;
+}
+
+.chat-stage--session .reference-card__path,
+.chat-stage--session .reference-card p {
+  color: #64748b;
+  font-size: 0.88rem;
+}
+
+.chat-stage--session .message-bubble--user .reference-card__summary span,
+.chat-stage--session .message-bubble--user .reference-card__path,
+.chat-stage--session .message-bubble--user .reference-card__snippet,
+.chat-stage--session .message-bubble--user .reference-card__title,
+.chat-stage--session .message-bubble--user .reference-card p {
+  color: #0f172a;
+}
+
+.chat-stage--session .evidence-card {
+  padding: 0.72rem 0.8rem;
+  border-radius: 14px;
+  background: rgba(248, 250, 252, 0.56);
+  box-shadow: none;
+}
+
+.chat-stage--session .evidence-panel {
+  gap: 0.55rem;
+  padding-top: 0.2rem;
+}
+
+.chat-stage--session .evidence-block {
+  gap: 0.42rem;
+}
+
+.chat-stage--session .evidence-card strong {
+  color: #475569;
+  font-size: 0.86rem;
+  font-weight: 600;
+}
+
+.chat-stage--session .evidence-card p,
+.chat-stage--session .evidence-card__snippet {
+  color: #64748b;
+  font-size: 0.88rem;
+}
+
+.chat-stage--session .composer__input {
+  min-height: 80px;
+}
+
+.chat-stage--session .composer__actions {
+  padding-top: 0.65rem;
+}
+
+.chat-stage--session .attach-button,
+.chat-stage--session .folder-button,
+.chat-stage--session .sync-button {
+  padding: 0.68rem 0.92rem;
+}
+
+.chat-stage--session .send-button {
+  padding: 0.74rem 1.05rem;
+}
+
+.folder-panel {
+  display: none !important;
+}
+
+.chat-stage--session .topbar {
+  border: none;
+  background: transparent;
+}
+
+.chat-stage--session .history-toggle {
+  padding: 0.2rem 0;
+  background: transparent;
+  box-shadow: none;
+}
+
+.chat-stage--session .brand-mark {
+  padding: 0.2rem 0;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+  font-size: 0.92rem;
 }
 
 @media (max-width: 920px) {
@@ -2625,6 +4829,584 @@ function isReferenceExpanded(messageId: number, referenceNumber: number) {
 
   .message-bubble {
     max-width: 100%;
+  }
+}
+
+.library-panel {
+  width: min(720px, calc(100vw - 2rem));
+  max-height: min(78vh, 860px);
+  overflow: auto;
+}
+
+.library-panel__tabs {
+  position: relative;
+  display: flex;
+  gap: 0.2rem;
+  margin-top: 0.75rem;
+  padding-bottom: 0;
+  overflow-x: auto;
+}
+
+.library-panel__tabs::after {
+  content: '';
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 1px;
+  background: rgba(15, 23, 42, 0.08);
+}
+
+.library-panel__tab {
+  position: relative;
+  z-index: 1;
+  border: 1px solid rgba(148, 163, 184, 0.2);
+  border-bottom: none;
+  background: rgba(241, 245, 249, 0.88);
+  color: rgba(15, 23, 42, 0.72);
+  border-radius: 10px 10px 0 0;
+  padding: 0.46rem 0.9rem 0.42rem;
+  font: inherit;
+  white-space: nowrap;
+  cursor: pointer;
+  line-height: 1.15;
+  transition: background 0.2s ease, border-color 0.2s ease, color 0.2s ease;
+}
+
+.library-panel__tab:hover {
+  background: rgba(226, 232, 240, 0.92);
+}
+
+.library-panel__tab--active {
+  background: rgba(255, 255, 255, 0.98);
+  border-color: rgba(148, 163, 184, 0.28);
+  color: #0f172a;
+  top: 0;
+}
+
+.library-panel__tab--active::after {
+  content: '';
+  position: absolute;
+  left: -1px;
+  right: -1px;
+  bottom: -1px;
+  height: 2px;
+  background: rgba(255, 255, 255, 0.98);
+}
+
+.library-panel__section {
+  display: grid;
+  gap: 0.9rem;
+  margin-top: 0;
+  padding-top: 0.7rem;
+  border-top: none;
+}
+
+.library-panel__section-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 1rem;
+}
+
+.library-panel__section-head h4 {
+  margin: 0;
+  font-size: 1rem;
+  color: #0f172a;
+}
+
+.library-panel__section-head p {
+  margin: 0.3rem 0 0;
+  color: rgba(15, 23, 42, 0.6);
+  line-height: 1.5;
+}
+
+.library-panel__select-row {
+  display: flex;
+  gap: 0.75rem;
+  align-items: center;
+}
+
+.library-panel__select {
+  flex: 1;
+  min-width: 0;
+  border: 1px solid rgba(148, 163, 184, 0.35);
+  border-radius: 14px;
+  background: rgba(255, 255, 255, 0.94);
+  padding: 0.85rem 0.95rem;
+  font: inherit;
+  color: #0f172a;
+}
+
+.library-panel__select:focus {
+  outline: none;
+  border-color: rgba(43, 100, 240, 0.42);
+  box-shadow: 0 0 0 3px rgba(43, 100, 240, 0.08);
+}
+
+.library-panel__create {
+  display: grid;
+  gap: 0.72rem;
+}
+
+.library-panel__field {
+  display: grid;
+  gap: 0.35rem;
+}
+
+.library-panel__field span {
+  font-size: 0.83rem;
+  font-weight: 600;
+  color: rgba(15, 23, 42, 0.72);
+}
+
+.library-panel__field input,
+.library-panel__field textarea {
+  width: 100%;
+  border: 1px solid rgba(148, 163, 184, 0.35);
+  border-radius: 14px;
+  background: rgba(255, 255, 255, 0.94);
+  padding: 0.8rem 0.95rem;
+  font: inherit;
+  color: #0f172a;
+  resize: vertical;
+  box-sizing: border-box;
+}
+
+.library-panel__field input:focus,
+.library-panel__field textarea:focus {
+  outline: none;
+  border-color: rgba(43, 100, 240, 0.42);
+  box-shadow: 0 0 0 3px rgba(43, 100, 240, 0.08);
+}
+
+.library-panel__field--error input,
+.library-panel__field--error textarea,
+.library-panel__field--error .model-config__chunk-toggle {
+  border-color: rgba(220, 38, 38, 0.42);
+  box-shadow: 0 0 0 3px rgba(220, 38, 38, 0.08);
+}
+
+.library-panel__field-error {
+  color: #dc2626;
+  font-size: 0.78rem;
+  line-height: 1.4;
+}
+
+.library-panel__folder-picker {
+  display: flex;
+  gap: 0.7rem;
+  align-items: center;
+}
+
+.library-panel__folder-picker input {
+  flex: 1;
+  min-width: 0;
+}
+
+.library-panel__subsection {
+  display: grid;
+  gap: 0.8rem;
+  padding: 0.95rem 1rem;
+  border: 1px solid rgba(148, 163, 184, 0.18);
+  border-radius: 16px;
+  background: rgba(248, 250, 252, 0.72);
+}
+
+.library-panel__subsection-head h5 {
+  margin: 0;
+  color: #0f172a;
+  font-size: 0.94rem;
+}
+
+.library-panel__subsection-head p {
+  margin: 0.28rem 0 0;
+  color: rgba(15, 23, 42, 0.6);
+  line-height: 1.5;
+}
+
+.model-config-grid {
+  display: grid;
+  gap: 0.9rem;
+}
+
+.model-config-card {
+  display: grid;
+  gap: 0.9rem;
+  padding: 1rem;
+  border: 1px solid rgba(148, 163, 184, 0.18);
+  border-radius: 18px;
+  background: rgba(248, 250, 252, 0.76);
+}
+
+.model-config-card__head h5 {
+  margin: 0;
+  color: #0f172a;
+  font-size: 0.98rem;
+}
+
+.model-config-card__head p {
+  margin: 0.32rem 0 0;
+  color: rgba(15, 23, 42, 0.6);
+  line-height: 1.5;
+}
+
+.model-config-fields {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.8rem;
+}
+
+.model-config-field--full {
+  grid-column: 1 / -1;
+}
+
+.model-config__hint {
+  display: block;
+  color: rgba(15, 23, 42, 0.54);
+  font-size: 0.78rem;
+  line-height: 1.45;
+}
+
+.model-config__chunk-toggle {
+  position: relative;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  padding: 0.25rem;
+  border: 1px solid rgba(148, 163, 184, 0.24);
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.88);
+}
+
+.model-config__chunk-thumb {
+  position: absolute;
+  top: 0.25rem;
+  left: 0.25rem;
+  width: calc(50% - 0.25rem);
+  height: calc(100% - 0.5rem);
+  border-radius: 999px;
+  background: linear-gradient(135deg, rgba(37, 99, 235, 0.14), rgba(79, 70, 229, 0.16));
+  transition: transform 0.2s ease;
+}
+
+.model-config__chunk-toggle[data-mode='semantic'] .model-config__chunk-thumb {
+  transform: translateX(100%);
+}
+
+.model-config__chunk-option {
+  position: relative;
+  z-index: 1;
+  padding: 0.72rem 0.8rem;
+  border: none;
+  background: transparent;
+  color: rgba(15, 23, 42, 0.6);
+  cursor: pointer;
+  font: inherit;
+  transition: color 0.2s ease;
+}
+
+.model-config__chunk-option--active {
+  color: #0f172a;
+  font-weight: 600;
+}
+
+.model-config-actions {
+  display: grid;
+  gap: 0.8rem;
+  margin-top: 0.2rem;
+}
+
+.model-config-status {
+  padding: 0.85rem 0.95rem;
+  border-radius: 14px;
+  background: rgba(59, 130, 246, 0.08);
+  color: #1d4ed8;
+  font-size: 0.88rem;
+}
+
+.model-config-actions__buttons {
+  display: flex;
+  justify-content: flex-end;
+  gap: 0.7rem;
+}
+
+.library-panel__section--models .model-config-grid > .model-config-card:nth-child(2) {
+  display: none;
+}
+
+.library-panel__list {
+  display: grid;
+  gap: 0.85rem;
+  margin-top: 1rem;
+  max-height: min(42vh, 420px);
+  overflow-y: auto;
+  padding-right: 0.15rem;
+}
+
+.library-panel__item {
+  display: grid;
+  gap: 0.75rem;
+  padding: 1rem;
+  border-radius: 18px;
+  border: 1px solid rgba(148, 163, 184, 0.22);
+  background: rgba(248, 250, 252, 0.82);
+}
+
+.library-panel__item--active {
+  border-color: rgba(43, 100, 240, 0.28);
+  background: rgba(241, 245, 255, 0.82);
+}
+
+.library-panel__summary {
+  display: grid;
+  gap: 0.4rem;
+}
+
+.library-panel__title-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+}
+
+.library-panel__title-row h4 {
+  margin: 0;
+  font-size: 1rem;
+  font-weight: 600;
+  color: #0f172a;
+}
+
+.library-panel__count {
+  flex-shrink: 0;
+  font-size: 0.78rem;
+  color: rgba(15, 23, 42, 0.55);
+}
+
+.library-panel__description,
+.library-panel__path {
+  margin: 0;
+  font-size: 0.9rem;
+  line-height: 1.5;
+}
+
+.library-panel__description {
+  color: rgba(15, 23, 42, 0.72);
+}
+
+.library-panel__path {
+  color: rgba(15, 23, 42, 0.52);
+  word-break: break-all;
+}
+
+.library-panel__actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.6rem;
+}
+
+.library-panel__section--select .library-panel__actions {
+  display: none;
+}
+
+.library-table-wrap {
+  overflow-x: auto;
+  border: 1px solid rgba(148, 163, 184, 0.16);
+  border-radius: 14px;
+  background: rgba(255, 255, 255, 0.94);
+}
+
+.library-table {
+  width: 100%;
+  border-collapse: collapse;
+  min-width: 760px;
+}
+
+.library-table th,
+.library-table td {
+  padding: 0.8rem 0.9rem;
+  text-align: left;
+  border-bottom: 1px solid rgba(226, 232, 240, 0.92);
+  font-size: 0.9rem;
+  color: #0f172a;
+  vertical-align: middle;
+}
+
+.library-table th {
+  background: rgba(248, 250, 252, 0.95);
+  color: rgba(15, 23, 42, 0.64);
+  font-weight: 600;
+}
+
+.library-table tbody tr:last-child td {
+  border-bottom: none;
+}
+
+.library-table__path {
+  max-width: 320px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.library-table__actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+
+.library-details {
+  width: min(880px, calc(100vw - 2rem));
+  max-height: min(82vh, 900px);
+  overflow: auto;
+}
+
+.library-details__body {
+  display: grid;
+  gap: 1rem;
+}
+
+.library-details__meta {
+  display: grid;
+  gap: 0.55rem;
+  padding: 0.95rem 1rem;
+  border-radius: 14px;
+  background: rgba(248, 250, 252, 0.78);
+  border: 1px solid rgba(148, 163, 184, 0.16);
+}
+
+.library-details__meta p {
+  margin: 0;
+  line-height: 1.55;
+  color: #0f172a;
+}
+
+.library-details__documents {
+  display: grid;
+  gap: 0.75rem;
+}
+
+.library-details__documents h4 {
+  margin: 0;
+  color: #0f172a;
+}
+
+.library-details__table-wrap {
+  overflow: auto;
+  border: 1px solid rgba(148, 163, 184, 0.16);
+  border-radius: 14px;
+  background: rgba(255, 255, 255, 0.94);
+}
+
+.library-details__table {
+  width: 100%;
+  border-collapse: collapse;
+  min-width: 560px;
+}
+
+.library-details__table th,
+.library-details__table td {
+  padding: 0.78rem 0.9rem;
+  border-bottom: 1px solid rgba(226, 232, 240, 0.92);
+  text-align: left;
+  vertical-align: middle;
+}
+
+.library-details__table th {
+  background: rgba(248, 250, 252, 0.95);
+  color: rgba(15, 23, 42, 0.64);
+  font-weight: 600;
+}
+
+.library-details__table tbody tr:last-child td {
+  border-bottom: none;
+}
+
+.library-details__title-button {
+  padding: 0;
+  border: none;
+  background: transparent;
+  color: #0f172a;
+  cursor: pointer;
+  font: inherit;
+  line-height: 1.5;
+  text-align: left;
+}
+
+.library-details__title-button:hover {
+  color: #111827;
+}
+
+.library-details__loading {
+  color: rgba(15, 23, 42, 0.64);
+  padding: 0.5rem 0;
+}
+
+.library-details__expand-row td {
+  background: rgba(248, 250, 252, 0.9);
+}
+
+.library-details__document-meta {
+  display: grid;
+  gap: 0.65rem;
+  padding: 0.85rem 0.2rem 0.25rem;
+}
+
+.library-details__document-meta p {
+  margin: 0;
+  color: #0f172a;
+  line-height: 1.65;
+  word-break: break-word;
+}
+
+.library-panel__action {
+  border: 1px solid rgba(148, 163, 184, 0.28);
+  background: rgba(255, 255, 255, 0.92);
+  color: #0f172a;
+  border-radius: 999px;
+  padding: 0.55rem 0.95rem;
+  font-size: 0.88rem;
+  cursor: pointer;
+  transition: background 0.2s ease, border-color 0.2s ease, transform 0.2s ease;
+}
+
+.library-panel__action:hover:not(:disabled) {
+  background: rgba(241, 245, 249, 1);
+  border-color: rgba(100, 116, 139, 0.35);
+  transform: translateY(-1px);
+}
+
+.library-panel__action:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+.library-panel__action--danger {
+  border-color: rgba(239, 68, 68, 0.18);
+  color: #b91c1c;
+}
+
+.library-panel__action--danger:hover:not(:disabled) {
+  background: rgba(254, 242, 242, 1);
+  border-color: rgba(239, 68, 68, 0.3);
+}
+
+.library-panel__empty {
+  padding: 1.25rem 1rem;
+  border-radius: 18px;
+  background: rgba(248, 250, 252, 0.76);
+  border: 1px dashed rgba(148, 163, 184, 0.28);
+  color: rgba(15, 23, 42, 0.6);
+  text-align: center;
+}
+
+@media (max-width: 640px) {
+  .model-config-fields {
+    grid-template-columns: 1fr;
+  }
+
+  .model-config-actions__buttons {
+    flex-direction: column;
+    align-items: stretch;
   }
 }
 

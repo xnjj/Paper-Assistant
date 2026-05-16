@@ -20,6 +20,7 @@ class ParsedDocument:
     file_hash: str
     raw_text: str
     page_count: int
+    abstract_priority_text: str = ""
 
 
 @dataclass
@@ -30,8 +31,11 @@ class ExtractedMetadata:
     abstract: str
     keywords: list[str] = field(default_factory=list)
     authors: list[str] = field(default_factory=list)
+    year: str = ""
     doi: str = ""
     url: str = ""
+    venue: str = ""
+    citation_text_default: str = ""
     language: str = "zh"
 
 
@@ -40,6 +44,7 @@ class DocumentRecord:
     """结构化数据库中的文献记录。"""
 
     id: int
+    library_id: int
     file_hash: str
     file_path: str
     file_name: str
@@ -47,7 +52,11 @@ class DocumentRecord:
     abstract: str
     authors_json: str
     keywords_json: str
+    year: str
     doi: str
+    url: str
+    venue: str
+    citation_text_default: str
     source_type: str
     source_uri: str
     content_text: str
@@ -61,6 +70,7 @@ class DocumentChunkRecord:
     """结构化数据库中的文献切片记录。"""
 
     id: int
+    library_id: int
     document_id: int
     chunk_index: int
     chunk_text: str
@@ -75,6 +85,7 @@ class SyncJobRecord:
     """一次文献库同步任务。"""
 
     id: int
+    library_id: int
     folder_path: str
     job_type: str
     status: str
@@ -107,6 +118,7 @@ class SessionRecord:
     """会话记录。"""
 
     id: int
+    library_id: int
     title: str
     user_goal: str
     is_pinned: bool
@@ -143,7 +155,24 @@ class IngestResult:
     path: str
     success: bool
     status: str
+    library_id: int | None = None
     title: str = ""
     file_hash: str = ""
     document_id: int | None = None
     error: str = ""
+
+
+@dataclass
+class LibraryRecord:
+    """鏂囩尞搴撹褰曘€?"""
+
+    id: int
+    name: str
+    description: str
+    folder_path: str
+    collection_name: str
+    embedding_model: str
+    embedding_max_input_tokens: int
+    chunk_mode: str
+    created_at: str
+    updated_at: str
