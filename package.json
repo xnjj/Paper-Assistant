@@ -2,15 +2,16 @@
   "name": "rag-paper-assistant",
   "private": true,
   "version": "0.1.0",
-  "workspaces": [
-    "frontend",
-    "desktop"
-  ],
+  "description": "Root scripts for the RAG Paper Assistant desktop app",
   "scripts": {
-    "dev": "concurrently \"npm --workspace frontend run dev\" \"npm --workspace desktop run dev\"",
-    "build": "npm --workspace frontend run build && npm --workspace desktop run build"
-  },
-  "devDependencies": {
-    "concurrently": "^9.1.2"
+    "dev": "npm --prefix rag-paper-assistan run dev",
+    "desktop": "npm --prefix rag-paper-assistan run desktop",
+    "build": "npm --prefix rag-paper-assistan run build",
+    "preview": "npm --prefix rag-paper-assistan run preview",
+    "type-check": "npm --prefix rag-paper-assistan run type-check",
+    "lint": "npm --prefix rag-paper-assistan run lint",
+    "test:unit": "npm --prefix rag-paper-assistan run test:unit",
+    "test:e2e": "npm --prefix rag-paper-assistan run test:e2e",
+    "format": "npm --prefix rag-paper-assistan run format"
   }
 }
