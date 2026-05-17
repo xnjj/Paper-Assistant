@@ -29,7 +29,7 @@
 ```text
 .
 ├─ app_backend/            # 后端服务、仓储、数据库与检索逻辑
-├─ rag-paper-assistan/     # Electron + Vue 前端桌面应用
+├─ rag-paper-assistant/     # Electron + Vue 前端桌面应用
 ├─ upload_api.py           # FastAPI 入口
 ├─ config_data.py          # 运行目录与默认配置
 ├─ requirements.txt        # Python 依赖
@@ -80,7 +80,7 @@ uvicorn upload_api:app --reload
 1. 安装前端依赖
 
 ```powershell
-cd rag-paper-assistan
+cd rag-paper-assistant
 npm install
 cd ..
 ```
@@ -131,7 +131,7 @@ npm run dev
 
 ```powershell
 pip install -r requirements.txt
-cd rag-paper-assistan
+cd rag-paper-assistant
 npm install
 cd ..
 ```
@@ -145,7 +145,7 @@ npm run dist
 生成结果默认位于：
 
 ```text
-rag-paper-assistan/release/
+rag-paper-assistant/release/
 ```
 
 补充说明：
@@ -156,5 +156,5 @@ rag-paper-assistan/release/
 ## 开发说明
 
 - 后端核心代码位于 `app_backend/`
-- 前端核心界面位于 `rag-paper-assistan/src/App.vue`
+- 前端核心界面位于 `rag-paper-assistant/src/App.vue`
 - 如果你准备开源该项目，建议同时保留 `.gitignore`，避免提交数据库、向量库、构建产物和缓存文件
