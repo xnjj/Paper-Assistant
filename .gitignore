@@ -11,6 +11,8 @@ node_modules/
 paper_demo/
 test/
 test_outputs/
+.venv-build/
+.vscode/
 
 rag-paper-assistant/node_modules/
 rag-paper-assistant/dist/
