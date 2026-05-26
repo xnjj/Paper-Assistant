@@ -279,6 +279,7 @@ const messages = ref<UiMessage[]>([])
 const currentGoal = ref('')
 const isBootstrapping = ref(true)
 const isSending = ref(false)
+const externalSearchEnabled = ref(false)
 const isLoadingMessages = ref(false)
 const debugStreaming = ref(false)
 const renamingSessionId = ref<number | null>(null)
@@ -1437,6 +1438,7 @@ async function streamChatResponse(sessionId: number, userMessage: string, assist
     body: JSON.stringify({
       message: userMessage,
       top_k: sessionModelConfig.value.rerankChunks,
+      allow_external_search: externalSearchEnabled.value,
     }),
   })
 
@@ -2150,6 +2152,23 @@ function citationBindingToDocument(citation: CitationBinding): RetrievedDocument
   }
 }
 
+function isExternalRetrievedDocument(document: RetrievedDocument | null) {
+  if (!document) {
+    return false
+  }
+  const sourceId = (document.source_id || '').toLowerCase()
+  return sourceId.startsWith('ext_')
+}
+
+function formatGb7714Citation(document: RetrievedDocument) {
+  const authors = (document.authors || []).filter((item) => item.trim().length > 0)
+  const authorText = authors.length > 0 ? authors.join(', ') : '作者未知'
+  const title = document.title?.trim() || '未命名文献'
+  const year = document.year?.trim() || '年份未知'
+  const url = document.url?.trim() || '暂无链接'
+  return `${authorText}. ${title}[EB/OL]. ${year}. ${url}.`
+}
+
 function matchReferenceToDocument(referenceText: string, documents: RetrievedDocument[]) {
   const normalizedReference = normalizeForMatch(referenceText)
   const normalizedReferenceDoi = normalizeDoi(referenceText)
@@ -2538,7 +2557,13 @@ function isReferenceExpanded(messageId: number, referenceNumber: number) {
                     <div class="reference-card__meta">
                       <div class="reference-card__summary">
                         <strong>[{{ reference.number }}]</strong>
-                        <span>{{ reference.text }}</span>
+                        <span>
+                          {{
+                            reference.matchedDocument && isExternalRetrievedDocument(reference.matchedDocument)
+                              ? formatGb7714Citation(reference.matchedDocument)
+                              : reference.text
+                          }}
+                        </span>
                       </div>
                     </div>
                     <div
@@ -2559,7 +2584,15 @@ function isReferenceExpanded(messageId: number, referenceNumber: number) {
                           DOI: {{ reference.matchedDocument.doi }}
                         </p> -->
                         <p>{{ reference.matchedDocument.abstract }}</p>
-                        <span class="reference-card__path">{{ reference.matchedDocument.file_path }}</span>
+                        <span
+                          class="reference-card__path"
+                        >
+                          {{
+                            isExternalRetrievedDocument(reference.matchedDocument)
+                              ? (reference.matchedDocument.url || '暂无链接')
+                              : reference.matchedDocument.file_path
+                          }}
+                        </span>
                         <!--调试检索到的文献片段-->
                         <!-- <span class="reference-card__snippet">{{ reference.matchedDocument.chunk_text }}</span> -->
                       </template>
@@ -2646,10 +2679,23 @@ function isReferenceExpanded(messageId: number, referenceNumber: number) {
                 {{ debugStreaming ? '调试中...' : '调试流式' }}
               </button> -->
             </div>
+            <div class="composer__right">
+              <button
+                class="external-search-button"
+                type="button"
+                :class="{ 'external-search-button--active': externalSearchEnabled }"
+                :aria-pressed="externalSearchEnabled"
+                :disabled="isSending"
+                title="联网搜索"
+                @click="externalSearchEnabled = !externalSearchEnabled"
+              >
+                联网搜索
+              </button>
 
-            <button class="send-button" type="button" :disabled="!canSend" @click="sendMessage">
-              {{ isSending ? '生成中...' : '发送' }}
-            </button>
+              <button class="send-button" type="button" :disabled="!canSend" @click="sendMessage">
+                {{ isSending ? '生成中...' : '发送' }}
+              </button>
+            </div>
           </div>
         </div>
       </section>
@@ -4174,8 +4220,15 @@ function isReferenceExpanded(messageId: number, referenceNumber: number) {
   gap: 0.85rem;
 }
 
+.composer__right {
+  display: flex;
+  align-items: center;
+  gap: 0.85rem;
+  margin-left: auto;
+}
+
 .composer__actions {
-  justify-content: space-between;
+  justify-content: flex-start;
   padding-top: 0.75rem;
 }
 
@@ -4231,10 +4284,32 @@ function isReferenceExpanded(messageId: number, referenceNumber: number) {
     opacity 0.18s ease;
 }
 
+.external-search-button {
+  padding: 0.72rem 1rem;
+  border: 1px solid rgba(14, 116, 144, 0.22);
+  border-radius: 999px;
+  background: rgba(14, 116, 144, 0.08);
+  color: #0f766e;
+  cursor: pointer;
+  font: inherit;
+  transition:
+    background 0.18s ease,
+    border-color 0.18s ease,
+    color 0.18s ease,
+    opacity 0.18s ease;
+}
+
+.external-search-button--active {
+  border-color: rgba(14, 116, 144, 0.44);
+  background: #0f766e;
+  color: #fff;
+}
+
 .send-button:disabled,
 .attach-button:disabled,
 .folder-button:disabled,
-.sync-button:disabled {
+.sync-button:disabled,
+.external-search-button:disabled {
   cursor: not-allowed;
   opacity: 0.45;
 }
@@ -4243,6 +4318,7 @@ function isReferenceExpanded(messageId: number, referenceNumber: number) {
 .attach-button:not(:disabled):hover,
 .folder-button:not(:disabled):hover,
 .sync-button:not(:disabled):hover,
+.external-search-button:not(:disabled):hover,
 .new-session-button:hover,
 .history-item:hover {
   transform: translateY(-1px);
@@ -4818,9 +4894,14 @@ function isReferenceExpanded(messageId: number, referenceNumber: number) {
 
   .topbar,
   .composer__actions,
-  .composer__left {
+  .composer__left,
+  .composer__right {
     align-items: flex-start;
     flex-direction: column;
+  }
+
+  .composer__right {
+    margin-left: 0;
   }
 
   .hero-copy h1 {

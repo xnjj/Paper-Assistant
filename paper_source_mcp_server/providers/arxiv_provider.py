@@ -1,0 +1,229 @@
+from __future__ import annotations
+
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import xml.etree.ElementTree as ET
+import socket
+
+from paper_source_mcp_server.providers.base import ExternalPaperProvider
+from paper_source_mcp_server.schemas import ExternalFulltextRecord, ExternalPaperRecord
+
+
+class ArxivProvider(ExternalPaperProvider):
+    """基于 arXiv 官方 API 的论文来源 provider。"""
+
+    source_name = "arxiv"
+    api_base_url = "http://export.arxiv.org/api/query"
+
+    def search(
+        self,
+        query: str,
+        *,
+        limit: int = 10,
+        year_from: int | None = None,
+        sort_by: str = "relevance",
+        sort_order: str = "descending",
+    ) -> list[ExternalPaperRecord]:
+        """调用 arXiv 官方 API 搜索论文候选，并在本地补做年份过滤。"""
+        search_query = self._build_search_query(query)
+        request_limit = self._resolve_request_limit(limit=limit, year_from=year_from)
+        # TODO： max_results=request_limit change for test, remove later
+        request_url = self._build_query_url(
+            search_query,
+            start=0,
+            max_results=5,
+            sort_by=sort_by,
+            sort_order=sort_order,
+        )
+        root = self._fetch_feed(request_url)
+        entries = root.findall(self._atom_tag("entry"))
+        records = [
+            record
+            for record in (self._entry_to_record(entry) for entry in entries)
+            if record is not None
+        ]
+        filtered_records = self._filter_records_by_year(records, year_from=year_from)
+        return filtered_records[:limit]
+
+    def get_detail(self, external_id: str) -> ExternalPaperRecord | None:
+        """按 arXiv 编号获取单篇论文详情。"""
+        if not external_id.strip():
+            return None
+        request_url = self._build_query_url(f"id:{external_id}", start=0, max_results=1)
+        root = self._fetch_feed(request_url)
+        entry = root.find(self._atom_tag("entry"))
+        if entry is None:
+            return None
+        return self._entry_to_record(entry)
+
+    def resolve_fulltext(self, record: ExternalPaperRecord) -> ExternalFulltextRecord | None:
+        """解析 arXiv 论文的 PDF 与落地页链接。"""
+        if not record.external_id.strip():
+            return None
+
+        pdf_url = record.pdf_url or f"https://arxiv.org/pdf/{record.external_id}.pdf"
+        landing_page_url = record.url or f"https://arxiv.org/abs/{record.external_id}"
+        return ExternalFulltextRecord(
+            source=self.source_name,
+            external_id=record.external_id,
+            title=record.title,
+            pdf_url=pdf_url,
+            download_url=pdf_url,
+            landing_page_url=landing_page_url,
+            content_type="application/pdf",
+            license="",
+            is_open_access=True,
+        )
+
+    def _build_search_query(self, query: str) -> str:
+        """构造 arXiv API 使用的基础查询表达式。"""
+        normalized_query = query.strip()
+        if not normalized_query:
+            return "all:*"
+        return f"all:{normalized_query}"
+
+    def _resolve_request_limit(self, *, limit: int, year_from: int | None) -> int:
+        """根据是否需要年份过滤，决定向 arXiv 额外多取多少结果。"""
+        if year_from is None:
+            return limit
+        return min(max(limit * 4, 20), 100)
+
+    def _filter_records_by_year(
+        self,
+        records: list[ExternalPaperRecord],
+        *,
+        year_from: int | None,
+    ) -> list[ExternalPaperRecord]:
+        """按年份下限过滤结果，避免把复杂日期范围直接交给 arXiv 查询。"""
+        if year_from is None:
+            return records
+
+        filtered_records: list[ExternalPaperRecord] = []
+        for record in records:
+            try:
+                record_year = int(record.year)
+            except (TypeError, ValueError):
+                continue
+            if record_year >= year_from:
+                filtered_records.append(record)
+        return filtered_records
+
+    def _build_query_url(
+        self,
+        search_query: str,
+        *,
+        start: int,
+        max_results: int,
+        sort_by: str = "relevance",
+        sort_order: str = "descending",
+    ) -> str:
+        """根据查询表达式构造 arXiv API 请求地址。"""
+        params = {
+            "search_query": search_query,
+            "start": str(start),
+            "max_results": str(max_results),
+            "sortBy": sort_by,
+            "sortOrder": sort_order,
+        }
+        return f"{self.api_base_url}?{urllib.parse.urlencode(params)}"
+
+    def _fetch_feed(self, request_url: str) -> ET.Element:
+        """请求 arXiv API，并在 429 等临时错误时进行有限重试。"""
+        request = urllib.request.Request(
+            request_url,
+            headers={
+                "User-Agent": "paper-source-mcp-server/0.1 (RAG-Agent external search test)",
+            },
+        )
+
+        last_error: Exception | None = None
+        for attempt_index in range(3):
+            try:
+                with urllib.request.urlopen(request, timeout=30) as response:
+                    payload = response.read()
+                return ET.fromstring(payload)
+            except urllib.error.HTTPError as exc:
+                last_error = exc
+                if exc.code == 429 and attempt_index < 2:
+                    time.sleep(2 * (attempt_index + 1))
+                    continue
+                raise
+            except urllib.error.URLError as exc:
+                last_error = exc
+                if attempt_index < 2:
+                    time.sleep(2 * (attempt_index + 1))
+                    continue
+                raise
+            except (TimeoutError, socket.timeout, OSError) as exc:
+                last_error = exc
+                if attempt_index < 2:
+                    time.sleep(2 * (attempt_index + 1))
+                    continue
+                raise
+
+        if last_error is not None:
+            raise last_error
+        raise RuntimeError("arXiv API 请求失败，且未获得可用的异常信息。")
+
+    def _entry_to_record(self, entry: ET.Element) -> ExternalPaperRecord | None:
+        """把单个 Atom entry 转换为统一论文记录。"""
+        title = self._read_text(entry, self._atom_tag("title"))
+        entry_id = self._read_text(entry, self._atom_tag("id"))
+        summary = self._read_text(entry, self._atom_tag("summary"))
+        published = self._read_text(entry, self._atom_tag("published"))
+        external_id = self._extract_arxiv_id(entry_id)
+        if not title or not external_id:
+            return None
+
+        authors = [
+            self._read_text(author, self._atom_tag("name"))
+            for author in entry.findall(self._atom_tag("author"))
+        ]
+        authors = [item for item in authors if item]
+
+        pdf_url = ""
+        for link in entry.findall(self._atom_tag("link")):
+            link_type = (link.attrib.get("type") or "").strip().lower()
+            title_attr = (link.attrib.get("title") or "").strip().lower()
+            href = (link.attrib.get("href") or "").strip()
+            if link_type == "application/pdf" or title_attr == "pdf":
+                pdf_url = href
+                break
+
+        return ExternalPaperRecord(
+            source=self.source_name,
+            external_id=external_id,
+            title=self._normalize_text(title),
+            authors=authors,
+            year=published[:4] if len(published) >= 4 else "",
+            venue="arXiv",
+            doi="",
+            url=entry_id.replace("http://", "https://"),
+            abstract=self._normalize_text(summary),
+            pdf_url=pdf_url.replace("http://", "https://"),
+            relevance_score=None,
+        )
+
+    def _read_text(self, element: ET.Element, tag: str) -> str:
+        """读取指定 XML 子节点的文本内容。"""
+        child = element.find(tag)
+        if child is None or child.text is None:
+            return ""
+        return child.text.strip()
+
+    def _extract_arxiv_id(self, entry_id: str) -> str:
+        """从 arXiv entry id 中提取 arXiv 编号。"""
+        normalized_id = entry_id.strip().rstrip("/")
+        if not normalized_id:
+            return ""
+        return normalized_id.rsplit("/", maxsplit=1)[-1]
+
+    def _normalize_text(self, value: str) -> str:
+        """清理 Atom 文本中的多余空白。"""
+        return " ".join(value.split())
+
+    def _atom_tag(self, name: str) -> str:
+        """构造 Atom XML 命名空间下的标签名。"""
+        return f"{{http://www.w3.org/2005/Atom}}{name}"

@@ -60,6 +60,7 @@ class UpdateSessionRequest(BaseModel):
 class ChatRequest(BaseModel):
     message: str
     top_k: int = 5
+    allow_external_search: bool = False
 
 
 class CreateMemoryRequest(BaseModel):
@@ -431,6 +432,7 @@ def chat_with_session(session_id: int, payload: ChatRequest) -> dict[str, object
             session_id=session_id,
             user_message=payload.message,
             top_k=payload.top_k,
+            allow_external_search=payload.allow_external_search,
         )
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
@@ -447,6 +449,7 @@ def stream_chat_with_session(session_id: int, payload: ChatRequest) -> Streaming
                 session_id=session_id,
                 user_message=payload.message,
                 top_k=payload.top_k,
+                allow_external_search=payload.allow_external_search,
             ):
                 yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
                 await asyncio.sleep(0.01)

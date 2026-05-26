@@ -11,12 +11,15 @@ from app_backend.repositories.sync_repository import SyncRepository
 from app_backend.services.chat_service import ChatService
 from app_backend.services.config_service import ConfigService
 from app_backend.services.document_ingest_service import DocumentIngestService
+from app_backend.services.agent_orchestrator_service import AgentOrchestratorService
 from app_backend.services.library_sync_service import LibrarySyncService
 from app_backend.services.memory_service import MemoryService
 from app_backend.services.metadata_extractor import MetadataExtractorService
+from app_backend.services.mcp_external_search_service import MCPExternalSearchService
 from app_backend.services.pdf_parser import PDFParserService
 from app_backend.services.rerank_service import RerankService
 from app_backend.services.retriever_service import RetrieverService
+from app_backend.services.stdio_mcp_tool_invoker import StdioMCPToolInvoker
 from app_backend.services.vector_index_service import VectorIndexService
 
 
@@ -65,10 +68,21 @@ class ServiceContainer:
             vector_index_service=self.vector_index_service,
             rerank_service=self.rerank_service,
         )
+        self.mcp_tool_invoker = StdioMCPToolInvoker()
+        self.external_search_service = MCPExternalSearchService(self.mcp_tool_invoker)
+        self.agent_orchestrator_service = AgentOrchestratorService(
+            session_repository=self.session_repository,
+            library_repository=self.library_repository,
+            memory_service=self.memory_service,
+            retriever_service=self.retriever_service,
+            config_service=self.config_service,
+            external_search_service=self.external_search_service,
+        )
         self.chat_service = ChatService(
             session_repository=self.session_repository,
             library_repository=self.library_repository,
             memory_service=self.memory_service,
             retriever_service=self.retriever_service,
             config_service=self.config_service,
+            agent_orchestrator_service=self.agent_orchestrator_service,
         )
