@@ -80,9 +80,8 @@ class ConfigService:
                     raise ValueError("No library index fields were updated.")
 
         if session_config is not None:
-            normalized_session = self._normalize_session_config(session_config)
-            pending_updates[self._session_key("recall_chunks")] = normalized_session["recall_chunks"]
-            pending_updates[self._session_key("rerank_chunks")] = normalized_session["rerank_chunks"]
+            # 检索块数已改为代码常量，保留入参兼容旧前端，但不再持久化用户配置。
+            self._normalize_session_config(session_config)
 
         self.config_repository.set_many_json_values(pending_updates)
         return self.get_model_config(library_id)
@@ -107,10 +106,10 @@ class ConfigService:
         return int(self._merge_global_config()["embedding_max_input_tokens"])
 
     def get_recall_chunks(self) -> int:
-        return int(self._merge_session_config()["recall_chunks"])
+        return config.TOP_K
 
     def get_rerank_chunks(self) -> int:
-        return int(self._merge_session_config()["rerank_chunks"])
+        return config.RECALL_K
 
     def get_requested_chunk_mode(self, library_id: int | None) -> str:
         return str(self._get_library_index_config(library_id)["chunk_mode"])
@@ -157,19 +156,10 @@ class ConfigService:
         }
 
     def _merge_session_config(self) -> dict[str, object]:
-        defaults = {
-            "recall_chunks": 20,
-            "rerank_chunks": 5,
-        }
-        payloads = self.config_repository.get_many_json_values(
-            [
-                self._session_key("recall_chunks"),
-                self._session_key("rerank_chunks"),
-            ]
-        )
+        # 会话级检索数量固定由 config_data.py 管理，不再读取数据库运行时配置。
         return {
-            "recall_chunks": self._as_positive_int(payloads.get(self._session_key("recall_chunks")), defaults["recall_chunks"]),
-            "rerank_chunks": self._as_positive_int(payloads.get(self._session_key("rerank_chunks")), defaults["rerank_chunks"]),
+            "recall_chunks": config.TOP_K,
+            "rerank_chunks": config.RECALL_K,
         }
 
     def _get_library_chunk_mode(self, library_id: int | None) -> str:

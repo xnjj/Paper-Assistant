@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+from collections.abc import Iterator
 from dataclasses import dataclass, field
-from typing import Protocol
+from typing import Any, Protocol
+
+import config_data as config
 
 
 @dataclass
@@ -20,6 +23,7 @@ class ExternalPaperCandidate:
     citation_text_default: str = ""
     pdf_url: str | None = None
     relevance_score: float | None = None
+    matched_query: str = ""
 
 
 @dataclass
@@ -44,10 +48,31 @@ class ExternalSearchService(Protocol):
         self,
         query: str,
         *,
-        limit: int = 10,
+        limit: int = config.MAX_EXTERNAL_QUERY_LIMIT,
         year_from: int | None = None,
+        sort_by: str = "relevance",
+        sort_order: str = "descending",
+        sources: list[str] | None = None,
     ) -> list[ExternalPaperCandidate]:
         """根据查询词搜索外部论文候选。"""
+        ...
+
+    def search_papers_batch(
+        self,
+        query_plans: list[dict[str, Any]],
+        *,
+        final_limit: int = config.DEFAULT_EXTERNAL_FINAL_LIMIT,
+    ) -> list[ExternalPaperCandidate]:
+        """根据多条 query 并发搜索外部论文候选。"""
+        ...
+
+    def iter_search_papers_batch(
+        self,
+        query_plans: list[dict[str, Any]],
+        *,
+        final_limit: int = config.DEFAULT_EXTERNAL_FINAL_LIMIT,
+    ) -> Iterator[dict[str, Any]]:
+        """以事件形式执行多条外部检索，并在最终事件中返回候选论文。"""
         ...
 
     def get_paper_detail(self, external_id: str) -> ExternalPaperCandidate | None:
@@ -66,11 +91,37 @@ class NullExternalSearchService:
         self,
         query: str,
         *,
-        limit: int = 10,
+        limit: int = config.MAX_EXTERNAL_QUERY_LIMIT,
         year_from: int | None = None,
+        sort_by: str = "relevance",
+        sort_order: str = "descending",
+        sources: list[str] | None = None,
     ) -> list[ExternalPaperCandidate]:
         """默认不返回任何外部候选。"""
         return []
+
+    def search_papers_batch(
+        self,
+        query_plans: list[dict[str, Any]],
+        *,
+        final_limit: int = config.DEFAULT_EXTERNAL_FINAL_LIMIT,
+    ) -> list[ExternalPaperCandidate]:
+        """默认不返回任何批量外部候选。"""
+        return []
+
+    def iter_search_papers_batch(
+        self,
+        query_plans: list[dict[str, Any]],
+        *,
+        final_limit: int = config.DEFAULT_EXTERNAL_FINAL_LIMIT,
+    ) -> Iterator[dict[str, Any]]:
+        """默认输出一个空的批量检索完成事件。"""
+        yield {
+            "type": "search_batch_done",
+            "candidates": [],
+            "raw_count": 0,
+            "deduped_count": 0,
+        }
 
     def get_paper_detail(self, external_id: str) -> ExternalPaperCandidate | None:
         """默认不提供任何外部详情。"""

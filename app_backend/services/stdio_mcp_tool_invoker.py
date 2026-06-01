@@ -86,7 +86,12 @@ class StdioMCPToolInvoker:
         """从 MCP 调用结果中提取结构化返回体，并把工具错误转成异常。"""
         if bool(getattr(result, "isError", False)) or bool(getattr(result, "is_error", False)):
             error_message = self._extract_tool_error_message(result)
-            raise RuntimeError(f"MCP tool call failed: {error_message or result!r}")
+            # 提供更多上下文以便排查：包含 error_message、原始 content、以及对象 repr
+            raw_content = getattr(result, "content", None)
+            raise RuntimeError(
+                f"MCP tool call failed: {error_message or repr(result)}; "
+                f"raw_content={raw_content!r}; result_repr={repr(result)}"
+            )
 
         structured_payload = getattr(result, "structuredContent", None)
         if isinstance(structured_payload, dict):

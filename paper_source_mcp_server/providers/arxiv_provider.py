@@ -6,6 +6,7 @@ import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 import socket
+import threading
 
 from paper_source_mcp_server.providers.base import ExternalPaperProvider
 from paper_source_mcp_server.schemas import ExternalFulltextRecord, ExternalPaperRecord
@@ -16,6 +17,9 @@ class ArxivProvider(ExternalPaperProvider):
 
     source_name = "arxiv"
     api_base_url = "http://export.arxiv.org/api/query"
+    _request_lock = threading.Lock()
+    _last_request_at = 0.0
+    _min_request_interval_seconds = 3.2
 
     def search(
         self,
@@ -27,13 +31,13 @@ class ArxivProvider(ExternalPaperProvider):
         sort_order: str = "descending",
     ) -> list[ExternalPaperRecord]:
         """调用 arXiv 官方 API 搜索论文候选，并在本地补做年份过滤。"""
-        search_query = self._build_search_query(query)
+        #search_query = self._build_search_query(query)
         request_limit = self._resolve_request_limit(limit=limit, year_from=year_from)
         # TODO： max_results=request_limit change for test, remove later
         request_url = self._build_query_url(
-            search_query,
+            search_query=query,
             start=0,
-            max_results=5,
+            max_results=request_limit,
             sort_by=sort_by,
             sort_order=sort_order,
         )
@@ -88,7 +92,8 @@ class ArxivProvider(ExternalPaperProvider):
         """根据是否需要年份过滤，决定向 arXiv 额外多取多少结果。"""
         if year_from is None:
             return limit
-        return min(max(limit * 4, 20), 100)
+        #return min(max(limit * 4, 10), 30)
+        return  min(limit * 4, 20) 
 
     def _filter_records_by_year(
         self,
@@ -141,13 +146,16 @@ class ArxivProvider(ExternalPaperProvider):
         last_error: Exception | None = None
         for attempt_index in range(3):
             try:
+                self._wait_for_rate_limit_window()
                 with urllib.request.urlopen(request, timeout=30) as response:
                     payload = response.read()
                 return ET.fromstring(payload)
             except urllib.error.HTTPError as exc:
                 last_error = exc
                 if exc.code == 429 and attempt_index < 2:
-                    time.sleep(2 * (attempt_index + 1))
+                    retry_after_seconds = self._parse_retry_after_seconds(exc)
+                    sleep_seconds = retry_after_seconds if retry_after_seconds is not None else (4 * (attempt_index + 1))
+                    time.sleep(sleep_seconds)
                     continue
                 raise
             except urllib.error.URLError as exc:
@@ -166,6 +174,27 @@ class ArxivProvider(ExternalPaperProvider):
         if last_error is not None:
             raise last_error
         raise RuntimeError("arXiv API 请求失败，且未获得可用的异常信息。")
+
+    def _wait_for_rate_limit_window(self) -> None:
+        """在本进程内做基础请求间隔控制，降低触发 429 的概率。"""
+        with self._request_lock:
+            now = time.time()
+            elapsed = now - self._last_request_at
+            wait_seconds = self._min_request_interval_seconds - elapsed
+            if wait_seconds > 0:
+                time.sleep(wait_seconds)
+            self._last_request_at = time.time()
+
+    def _parse_retry_after_seconds(self, exc: urllib.error.HTTPError) -> float | None:
+        """从 429 响应头读取 Retry-After 秒数；解析失败则返回 None。"""
+        try:
+            header_value = exc.headers.get("Retry-After") if exc.headers else None
+            if not header_value:
+                return None
+            seconds = float(str(header_value).strip())
+            return max(1.0, seconds)
+        except (TypeError, ValueError):
+            return None
 
     def _entry_to_record(self, entry: ET.Element) -> ExternalPaperRecord | None:
         """把单个 Atom entry 转换为统一论文记录。"""

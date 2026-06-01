@@ -1,7 +1,12 @@
 from __future__ import annotations
 
+from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import re
 from typing import Any, Protocol
 
+import config_data as config
+from app_backend.services.citation_formatter import format_gbt7714_citation
 from app_backend.services.external_search_service import (
     ExternalFulltextPayload,
     ExternalPaperCandidate,
@@ -40,30 +45,145 @@ class MCPExternalSearchService(ExternalSearchService):
         self,
         query: str,
         *,
-        limit: int = 10,
+        limit: int = config.MAX_EXTERNAL_QUERY_LIMIT,
         year_from: int | None = None,
+        sort_by: str = "relevance",
+        sort_order: str = "descending",
+        sources: list[str] | None = None,
     ) -> list[ExternalPaperCandidate]:
         """调用 MCP 检索工具获取外部论文候选。"""
         if self.tool_invoker is None:
             return []
 
+        arguments = {
+            "query": query,
+            "limit": limit,
+            "year_from": year_from,
+            "sort_by": sort_by,
+            "sort_order": sort_order,
+            "sources": sources or [self.default_source],
+        }
         try:
-            raw_result = self.tool_invoker.call_tool(
-                self.search_tool_name,
-                {
-                    "query": query,
-                    "limit": limit,
-                    "year_from": year_from,
-                    "sort_by": "submittedDate" if year_from is not None else "relevance",
-                    "sort_order": "descending",
-                    "sources": [self.default_source],
-                },
-            )
+            raw_result = self.tool_invoker.call_tool(self.search_tool_name, arguments)
         except Exception as exc:
-            print(f"MCP external search failed: {exc}")
+            if not self._is_rate_limit_error(exc):
+                print(f"MCP external search failed: {exc}")
+                return []
+
+            fallback_arguments = {
+                **arguments,
+                "limit": min(5, int(limit or config.MAX_EXTERNAL_QUERY_LIMIT)),
+                "year_from": None,
+                "sort_by": "relevance",
+            }
+            try:
+                raw_result = self.tool_invoker.call_tool(self.search_tool_name, fallback_arguments)
+            except Exception as fallback_exc:
+                print(f"MCP external search failed after fallback: {fallback_exc}")
+                return []
+
+        candidates = self._coerce_candidate_list(raw_result)
+        for candidate in candidates:
+            candidate.matched_query = query
+        return candidates
+
+    def search_papers_batch(
+        self,
+        query_plans: list[dict[str, Any]],
+        *,
+        final_limit: int = config.DEFAULT_EXTERNAL_FINAL_LIMIT,
+    ) -> list[ExternalPaperCandidate]:
+        """并发执行多条 MCP 检索，并对候选论文合并去重。"""
+        if self.tool_invoker is None or not query_plans:
             return []
 
-        return self._coerce_candidate_list(raw_result)
+        safe_plans = query_plans[: config.MAX_PARALLEL_EXTERNAL_QUERIES]
+        results_by_index: dict[int, list[ExternalPaperCandidate]] = {}
+        max_workers = min(config.MAX_PARALLEL_EXTERNAL_QUERIES, max(1, len(safe_plans)))
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_plan = {
+                executor.submit(self.search_papers, **query_plan): (index, query_plan)
+                for index, query_plan in enumerate(safe_plans)
+            }
+            for future in as_completed(future_to_plan):
+                index, query_plan = future_to_plan[future]
+                try:
+                    results_by_index[index] = future.result()
+                except Exception as exc:  # pragma: no cover - 外部服务异常以日志为主
+                    print(f"MCP external batch search failed for {query_plan.get('query')}: {exc}")
+                    results_by_index[index] = []
+
+        ordered_candidates: list[ExternalPaperCandidate] = []
+        for index in range(len(safe_plans)):
+            ordered_candidates.extend(results_by_index.get(index, []))
+
+        return self._dedupe_candidates(ordered_candidates)[: max(1, min(final_limit, config.DEFAULT_EXTERNAL_FINAL_LIMIT))]
+
+    def iter_search_papers_batch(
+        self,
+        query_plans: list[dict[str, Any]],
+        *,
+        final_limit: int = config.DEFAULT_EXTERNAL_FINAL_LIMIT,
+    ) -> Iterator[dict[str, Any]]:
+        """以事件形式并发执行多条 MCP 检索，便于前端展示准备进度。"""
+        if self.tool_invoker is None or not query_plans:
+            yield {
+                "type": "search_batch_done",
+                "candidates": [],
+                "raw_count": 0,
+                "deduped_count": 0,
+            }
+            return
+
+        safe_plans = query_plans[: config.MAX_PARALLEL_EXTERNAL_QUERIES]
+        results_by_index: dict[int, list[ExternalPaperCandidate]] = {}
+        max_workers = min(config.MAX_PARALLEL_EXTERNAL_QUERIES, max(1, len(safe_plans)))
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_plan = {}
+            for index, query_plan in enumerate(safe_plans):
+                query_id = self._build_query_step_id(index)
+                yield {
+                    "type": "search_query_start",
+                    "query_id": query_id,
+                    **self._build_query_event_payload(query_plan),
+                }
+                future = executor.submit(self.search_papers, **query_plan)
+                future_to_plan[future] = (index, query_id, query_plan)
+
+            for future in as_completed(future_to_plan):
+                index, query_id, query_plan = future_to_plan[future]
+                try:
+                    candidates = future.result()
+                    results_by_index[index] = candidates
+                    yield {
+                        "type": "search_query_done",
+                        "query_id": query_id,
+                        "result_count": len(candidates),
+                        **self._build_query_event_payload(query_plan),
+                    }
+                except Exception as exc:  # pragma: no cover - 外部服务异常以日志为主
+                    results_by_index[index] = []
+                    yield {
+                        "type": "search_query_error",
+                        "query_id": query_id,
+                        "error": str(exc),
+                        **self._build_query_event_payload(query_plan),
+                    }
+
+        ordered_candidates: list[ExternalPaperCandidate] = []
+        for index in range(len(safe_plans)):
+            ordered_candidates.extend(results_by_index.get(index, []))
+        deduped_candidates = self._dedupe_candidates(ordered_candidates)
+        limited_candidates = deduped_candidates[: max(1, min(final_limit, config.DEFAULT_EXTERNAL_FINAL_LIMIT))]
+
+        yield {
+            "type": "search_batch_done",
+            "candidates": limited_candidates,
+            "raw_count": len(ordered_candidates),
+            "deduped_count": len(deduped_candidates),
+        }
 
     def get_paper_detail(self, external_id: str) -> ExternalPaperCandidate | None:
         """调用 MCP 详情工具获取单篇外部论文信息。"""
@@ -157,6 +277,8 @@ class MCPExternalSearchService(ExternalSearchService):
                 year=year,
                 venue=venue,
                 doi=doi,
+                url=url,
+                source=source,
             ),
             pdf_url=pdf_url,
             relevance_score=relevance_score,
@@ -218,12 +340,68 @@ class MCPExternalSearchService(ExternalSearchService):
         year: str,
         venue: str,
         doi: str,
+        url: str,
+        source: str,
     ) -> str:
-        """为外部候选生成默认引用文本。"""
-        author_text = ", ".join(authors[:3]) if authors else "作者未知"
-        venue_text = venue or "来源未知"
-        year_text = year or "年份未知"
-        citation = f"{author_text}. {title}. {venue_text}, {year_text}."
-        if doi:
-            citation = f"{citation} DOI: {doi}"
-        return citation
+        """为外部候选生成近似 GB/T 7714-2015 的默认引用文本。"""
+        return format_gbt7714_citation(
+            authors=authors,
+            title=title,
+            year=year,
+            venue=venue,
+            doi=doi,
+            url=url,
+            source_type=source or "external",
+        )
+
+    def _dedupe_candidates(self, candidates: list[ExternalPaperCandidate]) -> list[ExternalPaperCandidate]:
+        """按来源 ID、URL、标题逐级去重外部候选。"""
+        deduped: list[ExternalPaperCandidate] = []
+        seen_keys: set[str] = set()
+        for candidate in candidates:
+            key = self._build_candidate_unique_key(candidate)
+            if not key or key in seen_keys:
+                continue
+            seen_keys.add(key)
+            deduped.append(candidate)
+        return deduped
+
+    def _build_candidate_unique_key(self, candidate: ExternalPaperCandidate) -> str:
+        """构造外部候选论文的去重键。"""
+        source = (candidate.source or "").strip().lower()
+        external_id = (candidate.external_id or "").strip().lower()
+        if source and external_id:
+            return f"{source}:{external_id}"
+
+        url = (candidate.url or "").strip().lower()
+        if url:
+            return f"url:{url.rstrip('/')}"
+
+        title = self._normalize_for_key(candidate.title)
+        return f"title:{title}" if title else ""
+
+    def _normalize_for_key(self, value: str) -> str:
+        """把字符串规整为适合比较的 key。"""
+        return re.sub(r"\s+", " ", (value or "").strip().lower())
+
+    def _is_rate_limit_error(self, exc: Exception) -> bool:
+        """判断异常是否属于外部检索限流。"""
+        message = str(exc).lower()
+        return "429" in message or "too many requests" in message
+
+    def _build_query_step_id(self, index: int) -> str:
+        """为一条并发检索 query 构造前端可稳定更新的步骤 ID。"""
+        return f"external-query-{index + 1}"
+
+    def _build_query_event_payload(self, query_plan: dict[str, Any]) -> dict[str, Any]:
+        """把检索 query 参数转换为前端准备区事件载荷。"""
+        sources = query_plan.get("sources")
+        if not isinstance(sources, list) or not sources:
+            sources = [self.default_source]
+        source_text = ", ".join(str(item).strip() for item in sources if str(item).strip())
+        return {
+            "source": source_text or self.default_source,
+            "query": str(query_plan.get("query") or ""),
+            "sort_by": str(query_plan.get("sort_by") or "relevance"),
+            "sort_order": str(query_plan.get("sort_order") or "descending"),
+        }

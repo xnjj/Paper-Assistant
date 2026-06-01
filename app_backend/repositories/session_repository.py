@@ -18,8 +18,8 @@ class SessionRepository:
         """
         self.db_manager = db_manager
 
-    def create_session(self, title: str, user_goal: str, library_id: int) -> int:
-        """Create a new chat session bound to one library."""
+    def create_session(self, title: str, user_goal: str, library_id: int | None) -> int:
+        """Create a new chat session, optionally bound to one library."""
         now = datetime.now().isoformat(timespec="seconds")
         with self.db_manager.get_connection() as connection:
             cursor = connection.execute(
@@ -78,6 +78,20 @@ class SessionRepository:
                 WHERE id = ?
                 """,
                 (1 if is_pinned else 0, session_id),
+            )
+            return cursor.rowcount > 0
+
+    def update_session_library_id(self, session_id: int, library_id: int) -> bool:
+        """为尚未绑定文献库的会话写入文献库 ID。"""
+        now = datetime.now().isoformat(timespec="seconds")
+        with self.db_manager.get_connection() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE chat_sessions
+                SET library_id = ?, updated_at = ?
+                WHERE id = ? AND library_id IS NULL
+                """,
+                (library_id, now, session_id),
             )
             return cursor.rowcount > 0
 

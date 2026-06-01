@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 
+import config_data as config
 from app_backend.repositories.document_repository import DocumentRepository
 from app_backend.repositories.library_repository import LibraryRepository
 from app_backend.services.rerank_service import RerankService
@@ -85,6 +86,7 @@ class RetrieverService:
             query=query,
             candidates=merged_results,
             top_k=top_k,
+            max_chunks_per_document=config.CHUNK_LIMIT_PER_PAPER,
         )
 
     def _loads_json_list(self, raw_value: str) -> list[str]:

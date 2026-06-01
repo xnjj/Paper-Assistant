@@ -107,7 +107,6 @@ npm run dev
 
 - SQLite 数据库
 - Chroma 向量索引
-- 上传后的 PDF 文件
 - 运行时配置文件
 
 这些运行产物通常不建议提交到 Git 仓库。

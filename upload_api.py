@@ -3,10 +3,9 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-from datetime import datetime
 from pathlib import Path
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
@@ -14,7 +13,7 @@ from pydantic import BaseModel
 import config_data as config
 from app_backend.bootstrap import ServiceContainer
 
-app = FastAPI(title="RAG Paper Assistant Upload API")
+app = FastAPI(title="RAG Paper Assistant API")
 container = ServiceContainer()
 
 app.add_middleware(
@@ -55,11 +54,12 @@ class CreateSessionRequest(BaseModel):
 class UpdateSessionRequest(BaseModel):
     title: str | None = None
     is_pinned: bool | None = None
+    library_id: int | None = None
 
 
 class ChatRequest(BaseModel):
     message: str
-    top_k: int = 5
+    top_k: int = config.RECALL_K
     allow_external_search: bool = False
 
 
@@ -98,23 +98,6 @@ class UpdateModelConfigRequest(BaseModel):
     session_config: SessionModelConfigPayload | None = None
 
 
-def ensure_directory(path_value: str) -> Path:
-    """Create and return one directory path."""
-    directory = Path(path_value)
-    directory.mkdir(parents=True, exist_ok=True)
-    return directory
-
-
-def build_saved_name(original_name: str) -> str:
-    """Build a collision-resistant local filename for an uploaded PDF."""
-    source_path = Path(original_name)
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-    safe_stem = "".join(char if char.isalnum() or char in {"-", "_"} else "_" for char in source_path.stem)
-    safe_stem = safe_stem.strip("_") or "paper"
-    suffix = source_path.suffix or ".pdf"
-    return f"{timestamp}_{safe_stem}{suffix}"
-
-
 def resolve_library_id(library_id: int | None) -> int:
     """Resolve a nullable library id to a concrete target library id."""
     if library_id is not None:
@@ -138,36 +121,6 @@ def resolve_configured_folder(library_id: int | None, folder_path: str | None) -
 def health_check() -> dict[str, str]:
     """Liveness probe."""
     return {"status": "ok"}
-
-
-@app.get("/api/debug/stream")
-def debug_stream() -> StreamingResponse:
-    """Return a deterministic SSE stream used to debug frontend streaming."""
-
-    async def event_generator():
-        chunks = [
-            {"type": "meta", "label": "debug-stream"},
-            {"type": "delta", "content": "这是一段调试流式输出，"},
-            {"type": "delta", "content": "如果你能逐步看到这句话，"},
-            {"type": "delta", "content": "说明前端流式渲染链路是通的。"},
-            {
-                "type": "done",
-                "answer": "这是一段调试流式输出，如果你能逐步看到这句话，说明前端流式渲染链路是通的。",
-            },
-        ]
-        for item in chunks:
-            yield f"data: {json.dumps(item, ensure_ascii=False)}\n\n"
-            await asyncio.sleep(0.35)
-
-    return StreamingResponse(
-        event_generator(),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache, no-transform",
-            "Connection": "keep-alive",
-            "X-Accel-Buffering": "no",
-        },
-    )
 
 
 @app.get("/api/libraries")
@@ -393,17 +346,21 @@ def create_session(payload: CreateSessionRequest) -> dict[str, object]:
 
 @app.patch("/api/sessions/{session_id}")
 def rename_session(session_id: int, payload: UpdateSessionRequest) -> dict[str, object]:
-    """Rename or pin/unpin one session."""
+    """Update one session title, pin status or one-time library binding."""
     try:
         session = None
         if payload.title is not None:
             session = container.chat_service.rename_session(session_id, payload.title)
         if payload.is_pinned is not None:
             session = container.chat_service.set_session_pinned(session_id, payload.is_pinned)
+        if payload.library_id is not None:
+            session = container.chat_service.bind_session_library(session_id, payload.library_id)
         if session is None:
-            raise HTTPException(status_code=400, detail="Please provide title or is_pinned.")
+            raise HTTPException(status_code=400, detail="Please provide title, is_pinned or library_id.")
     except ValueError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
+        detail = str(exc)
+        status_code = 404 if "not found" in detail.lower() else 400
+        raise HTTPException(status_code=status_code, detail=detail) from exc
     return {"success": True, "session": session.__dict__}
 
 
@@ -422,22 +379,6 @@ def list_session_messages(session_id: int) -> dict[str, object]:
     """Return the full message history for one session."""
     messages = [message.__dict__ for message in container.chat_service.list_messages(session_id)]
     return {"session_id": session_id, "messages": messages}
-
-
-@app.post("/api/sessions/{session_id}/chat")
-def chat_with_session(session_id: int, payload: ChatRequest) -> dict[str, object]:
-    """Handle one non-streaming chat turn."""
-    try:
-        result = container.chat_service.chat(
-            session_id=session_id,
-            user_message=payload.message,
-            top_k=payload.top_k,
-            allow_external_search=payload.allow_external_search,
-        )
-    except ValueError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
-    return {"success": True, **result}
-
 
 @app.post("/api/sessions/{session_id}/chat/stream")
 def stream_chat_with_session(session_id: int, payload: ChatRequest) -> StreamingResponse:
@@ -466,72 +407,6 @@ def stream_chat_with_session(session_id: int, payload: ChatRequest) -> Streaming
             "X-Accel-Buffering": "no",
         },
     )
-
-
-@app.get("/api/memories")
-def list_memories(scope: str | None = None, session_id: int | None = None) -> dict[str, object]:
-    """List stored memories."""
-    memories = [memory.__dict__ for memory in container.memory_service.list_memories(scope, session_id=session_id)]
-    return {"memories": memories}
-
-
-@app.post("/api/memories")
-def create_memory(payload: CreateMemoryRequest) -> dict[str, object]:
-    """Create one explicit memory record."""
-    memory_id = container.memory_service.save_memory(
-        scope=payload.scope,
-        memory_type=payload.memory_type,
-        content=payload.content,
-        summary=payload.summary,
-        session_id=payload.session_id,
-        importance=payload.importance,
-    )
-    return {"success": True, "memory_id": memory_id}
-
-
-@app.post("/api/upload-papers")
-async def upload_papers(
-    files: list[UploadFile] = File(...),
-    library_id: int | None = Form(None),
-) -> dict[str, object]:
-    """Upload PDFs and ingest them into one library."""
-    target_library_id = resolve_library_id(library_id)
-    upload_dir = ensure_directory(config.UPLOAD_FOLDER)
-    saved_paths: list[str] = []
-    saved_files: list[dict[str, str]] = []
-
-    for file in files:
-        if not file.filename or not file.filename.lower().endswith(".pdf"):
-            continue
-
-        target_path = upload_dir / build_saved_name(file.filename)
-        content = await file.read()
-        target_path.write_bytes(content)
-
-        resolved_path = str(target_path.resolve())
-        saved_paths.append(resolved_path)
-        saved_files.append({"name": file.filename, "path": resolved_path})
-
-    if not saved_paths:
-        raise HTTPException(status_code=400, detail="No valid PDF files were uploaded.")
-
-    try:
-        results = container.document_ingest_service.ingest_paths(
-            saved_paths,
-            source_type="upload",
-            library_id=target_library_id,
-        )
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-    return {
-        "success": True,
-        "library_id": target_library_id,
-        "message": f"Uploaded and processed {len(saved_paths)} files.",
-        "saved_files": saved_files,
-        "results": [result.__dict__ for result in results],
-    }
-
 
 if __name__ == "__main__":
     import uvicorn

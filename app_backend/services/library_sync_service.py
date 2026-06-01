@@ -11,6 +11,7 @@ from app_backend.models import LibraryRecord
 from app_backend.repositories.document_repository import DocumentRepository
 from app_backend.repositories.library_repository import LibraryRepository
 from app_backend.repositories.sync_repository import SyncRepository
+from app_backend.services.citation_formatter import format_gbt7714_citation
 from app_backend.services.document_ingest_service import DocumentIngestService
 from app_backend.services.vector_index_service import VectorIndexService
 
@@ -81,6 +82,7 @@ class LibrarySyncService:
         if document is None or document.library_id != library.id:
             raise ValueError(f"Document not found in library: {document_id}")
 
+        authors = self._parse_json_list(document.authors_json)
         return {
             "id": document.id,
             "library_id": document.library_id,
@@ -89,13 +91,22 @@ class LibrarySyncService:
             "file_name": document.file_name,
             "title": document.title,
             "abstract": document.abstract,
-            "authors": self._parse_json_list(document.authors_json),
+            "authors": authors,
             "keywords": self._parse_json_list(document.keywords_json),
             "year": document.year,
             "doi": document.doi,
             "url": document.url,
             "venue": document.venue,
-            "citation_text_default": document.citation_text_default,
+            "citation_text_default": self._format_document_citation(
+                authors=authors,
+                title=document.title,
+                year=document.year,
+                venue=document.venue,
+                doi=document.doi,
+                url=document.url,
+                source_type=document.source_type,
+                fallback=document.citation_text_default,
+            ),
             "source_type": document.source_type,
             "source_uri": document.source_uri,
             "status": document.status,
@@ -662,6 +673,30 @@ class LibrarySyncService:
         except json.JSONDecodeError:
             return []
         return [str(item) for item in parsed] if isinstance(parsed, list) else []
+
+    @staticmethod
+    def _format_document_citation(
+        *,
+        authors: list[str],
+        title: str,
+        year: str,
+        venue: str,
+        doi: str,
+        url: str,
+        source_type: str,
+        fallback: str,
+    ) -> str:
+        """为文献详情接口生成近似 GB/T 7714-2015 的引用文本。"""
+        citation = format_gbt7714_citation(
+            authors=authors,
+            title=title,
+            year=year,
+            venue=venue,
+            doi=doi,
+            url=url,
+            source_type=source_type or "local",
+        )
+        return citation or fallback
 
     def _require_library(self, library_id: int) -> LibraryRecord:
         """Load a library or raise a helpful error."""

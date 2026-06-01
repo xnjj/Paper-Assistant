@@ -12,6 +12,7 @@ from langchain_core.prompts import ChatPromptTemplate
 
 import config_data as config
 from app_backend.models import ExtractedMetadata, ParsedDocument
+from app_backend.services.citation_formatter import format_gbt7714_citation
 from app_backend.services.config_service import ConfigService
 
 logger = logging.getLogger(__name__)
@@ -563,35 +564,16 @@ class MetadataExtractorService:
         doi: str,
         url: str,
     ) -> str:
-        """生成一个稳定的默认引用字符串。
-
-        这里先不强行做严格样式化，而是保证任何文献都能有一个稳定、
-        可展示、可复制的默认引用文本。
-        """
-        author_text = self._format_author_block(authors)
-        document_type = "[J]" if venue else "[EB/OL]"
-
-        parts: list[str] = []
-        if author_text:
-            parts.append(f"{author_text}.")
-        parts.append(f"{title}{document_type}.")
-
-        venue_bits = [bit for bit in [venue, year] if bit]
-        if venue_bits:
-            parts.append(" ".join(venue_bits) + ".")
-        if doi:
-            parts.append(f"DOI: {doi}.")
-        if url and (not doi or url != f"https://doi.org/{doi}"):
-            parts.append(f"Available at: {url}.")
-        return " ".join(parts).strip()
-
-    def _format_author_block(self, authors: list[str]) -> str:
-        """把作者列表格式化成默认引用里的作者段。"""
-        if not authors:
-            return ""
-        if len(authors) <= 6:
-            return ", ".join(authors)
-        return ", ".join(authors[:6]) + ", et al"
+        """生成近似 GB/T 7714-2015 的默认引用字符串。"""
+        return format_gbt7714_citation(
+            authors=authors,
+            title=title,
+            year=year,
+            venue=venue,
+            doi=doi,
+            url=url,
+            source_type="local",
+        )
 
 
 class PathFallback:

@@ -3,7 +3,7 @@ import { computed, nextTick, onBeforeUnmount, onMounted, ref } from 'vue'
 
 interface SessionSummary {
   id: number
-  library_id: number
+  library_id: number | null
   title: string
   user_goal: string
   is_pinned: boolean
@@ -110,6 +110,45 @@ interface RetrievedMemory {
   created_at: string
 }
 
+type PreparationStepStatus = 'running' | 'success' | 'error'
+type PreparationStatus = 'thinking' | 'done'
+
+interface MessagePreparationStep {
+  id: string
+  status: PreparationStepStatus
+  source: string
+  query: string
+  sortBy: string
+  sortOrder: string
+  resultCount?: number
+  error?: string
+}
+
+interface MessagePreparation {
+  status: PreparationStatus
+  expanded: boolean
+  startedAt: number
+  elapsedSeconds: number | null
+  steps: MessagePreparationStep[]
+}
+
+interface PersistedPreparationStep {
+  id?: string
+  status?: PreparationStepStatus
+  source?: string
+  query?: string
+  sort_by?: string
+  sort_order?: string
+  result_count?: number
+  error?: string
+}
+
+interface PersistedPreparation {
+  status?: PreparationStatus
+  elapsed_seconds?: number
+  steps?: PersistedPreparationStep[]
+}
+
 interface UiMessage {
   id: number
   sessionId: number
@@ -119,17 +158,13 @@ interface UiMessage {
   retrievedDocuments: RetrievedDocument[]
   retrievedMemories: RetrievedMemory[]
   citations: CitationBinding[]
+  preparation?: MessagePreparation
 }
 
 interface ReferenceEntry {
   number: number
   text: string
   matchedDocument: RetrievedDocument | null
-}
-
-interface UploadedFileRecord {
-  name: string
-  path: string
 }
 
 interface SyncResultRecord {
@@ -224,15 +259,9 @@ interface LibraryModelConfigPayload {
   semantic_chunking_enabled?: boolean
 }
 
-interface SessionModelConfigPayload {
-  recall_chunks: number
-  rerank_chunks: number
-}
-
 interface ModelConfigResponsePayload {
   global: GlobalModelConfigPayload
   library: LibraryModelConfigPayload
-  session: SessionModelConfigPayload
   library_id: number | null
 }
 
@@ -265,7 +294,39 @@ interface StreamErrorEvent {
   message: string
 }
 
-type StreamEvent = StreamMetaEvent | StreamDeltaEvent | StreamDoneEvent | StreamErrorEvent
+interface StreamPrepareStartEvent {
+  type: 'prepare_start'
+}
+
+interface StreamPrepareStepPayload {
+  id: string
+  status: PreparationStepStatus
+  source: string
+  query: string
+  sort_by: string
+  sort_order: string
+  result_count?: number
+  error?: string
+}
+
+interface StreamPrepareStepEvent {
+  type: 'prepare_step'
+  step: StreamPrepareStepPayload
+}
+
+interface StreamPrepareDoneEvent {
+  type: 'prepare_done'
+  elapsed_seconds: number
+}
+
+type StreamEvent =
+  | StreamMetaEvent
+  | StreamDeltaEvent
+  | StreamDoneEvent
+  | StreamErrorEvent
+  | StreamPrepareStartEvent
+  | StreamPrepareStepEvent
+  | StreamPrepareDoneEvent
 
 const API_BASE_URL = 'http://127.0.0.1:8000'
 
@@ -302,10 +363,6 @@ const openSessionMenuId = ref<number | null>(null)
 const messageStreamRef = ref<HTMLElement | null>(null)
 const followMessageStreamToBottom = ref(false)
 
-const fileInputRef = ref<HTMLInputElement | null>(null)
-const selectedFileNames = ref<string[]>([])
-const uploadedFiles = ref<UploadedFileRecord[]>([])
-const uploading = ref(false)
 const syncing = ref(false)
 const activeSyncJobId = ref<number | null>(null)
 const configuringFolder = ref(false)
@@ -319,9 +376,11 @@ const statusMessageIsError = ref(false)
 const syncStatusMessage = ref('')
 const syncStatusMessageIsError = ref(false)
 const errorMessage = ref('')
+const preparationTicker = ref(Date.now())
 
 let suppressMessageStreamScroll = false
 let syncJobPollToken = 0
+let preparationTimerId: number | null = null
 
 const quickPrompts: PromptTemplateCard[] = [
   {
@@ -358,6 +417,7 @@ const canSend = computed(() => inputValue.value.trim().length > 0 && !isSending.
 const desktopMode = computed(() => Boolean(window.electronAPI))
 const activeLibrary = computed(() => libraries.value.find((item) => item.id === activeLibraryId.value) ?? null)
 const activeLibraryName = computed(() => activeLibrary.value?.name ?? '')
+const hasComposerLibrary = computed(() => activeLibrary.value !== null)
 const libraryPanelOpen = ref(false)
 const libraryPanelTab = ref<'select' | 'create' | 'manage' | 'models'>('select')
 const panelSelectedLibraryId = ref<number | null>(null)
@@ -418,18 +478,12 @@ const libraryModelConfig = ref<{
 }>({
   chunkMode: 'recursive',
 })
-const sessionModelConfig = ref({
-  recallChunks: 20,
-  rerankChunks: 5,
-})
 const loadingModelConfig = ref(false)
 const savingModelConfig = ref(false)
 const modelConfigFieldErrors = ref({
   llmModel: '',
   llmContextLength: '',
   apiKey: '',
-  recallChunks: '',
-  rerankChunks: '',
 })
 const modelConfigDraftStatus = ref('')
 const modelConfigLibraryId = computed(() => panelSelectedLibraryId.value ?? activeLibraryId.value)
@@ -457,8 +511,6 @@ function clearModelConfigFieldErrors() {
     llmModel: '',
     llmContextLength: '',
     apiKey: '',
-    recallChunks: '',
-    rerankChunks: '',
   }
 }
 
@@ -513,22 +565,6 @@ function validateModelConfigForm() {
 
   if (!globalModelConfig.value.apiKey.trim()) {
     modelConfigFieldErrors.value.apiKey = '请输入 API_KEY。'
-  }
-
-  if (!Number.isFinite(Number(sessionModelConfig.value.recallChunks)) || Number(sessionModelConfig.value.recallChunks) <= 0) {
-    modelConfigFieldErrors.value.recallChunks = '请输入大于 0 的召回块数。'
-  }
-
-  if (!Number.isFinite(Number(sessionModelConfig.value.rerankChunks)) || Number(sessionModelConfig.value.rerankChunks) <= 0) {
-    modelConfigFieldErrors.value.rerankChunks = '请输入大于 0 的重排块数。'
-  }
-
-  if (
-    !modelConfigFieldErrors.value.recallChunks &&
-    !modelConfigFieldErrors.value.rerankChunks &&
-    Number(sessionModelConfig.value.rerankChunks) > Number(sessionModelConfig.value.recallChunks)
-  ) {
-    modelConfigFieldErrors.value.rerankChunks = '重排块数不能大于召回块数。'
   }
 
   return Object.values(modelConfigFieldErrors.value).every((message) => !message)
@@ -625,10 +661,6 @@ function resetModelConfigDraft() {
   libraryModelConfig.value = {
     chunkMode: 'recursive',
   }
-  sessionModelConfig.value = {
-    recallChunks: 20,
-    rerankChunks: 5,
-  }
   modelConfigDraftStatus.value = ''
 }
 
@@ -657,10 +689,6 @@ async function saveModelConfig() {
               chunk_mode: libraryModelConfig.value.chunkMode,
             }
           : null,
-      session_config: {
-        recall_chunks: sessionModelConfig.value.recallChunks,
-        rerank_chunks: sessionModelConfig.value.rerankChunks,
-      },
     })
     applyModelConfigPayload(payload.config)
     modelConfigDraftStatus.value =
@@ -686,10 +714,6 @@ function applyModelConfigPayload(payload: ModelConfigResponsePayload) {
   libraryModelConfig.value = {
     chunkMode: payload.library.chunk_mode,
   }
-  sessionModelConfig.value = {
-    recallChunks: payload.session.recall_chunks,
-    rerankChunks: payload.session.rerank_chunks,
-  }
 }
 
 async function chooseFolderForNewLibrary() {
@@ -708,26 +732,51 @@ async function chooseFolderForNewLibrary() {
   newLibraryFieldErrors.value.folderPath = ''
 }
 
-function useSelectedLibraryForChat() {
+// 将文献库绑定到当前会话；若当前还没有会话，则作为下一次创建会话的文献库选择。
+async function bindLibraryToCurrentSession(libraryId: number) {
+  if (activeSessionId.value === null) {
+    applyLibrarySelection(libraryId)
+    return 'selected_for_new_session'
+  }
+
+  if (activeLibraryId.value !== null) {
+    if (activeLibraryId.value === libraryId) {
+      return 'already_bound'
+    }
+    throw new Error('当前会话已绑定文献库，不能修改。')
+  }
+
+  const payload = await patchJson<{ success: boolean; session: SessionSummary }>(
+    `/api/sessions/${activeSessionId.value}`,
+    { library_id: libraryId },
+  )
+  sessions.value = sessions.value.map((item) => (item.id === payload.session.id ? payload.session : item))
+  currentGoal.value = payload.session.user_goal
+  applyLibrarySelection(payload.session.library_id ?? null)
+  await refreshSessions()
+  return 'bound_current_session'
+}
+
+async function useSelectedLibraryForChat() {
   const libraryId = panelSelectedLibraryId.value
   if (libraryId === null) {
     errorMessage.value = '请先选择一个文献库。'
     return
   }
 
-  const switchingSessionLibrary = activeSessionId.value !== null && activeLibraryId.value !== libraryId
-  if (switchingSessionLibrary) {
-    activeSessionId.value = null
-    messages.value = []
-    currentGoal.value = ''
-    activeReferenceKey.value = null
+  clearFeedback()
+  try {
+    const bindingResult = await bindLibraryToCurrentSession(libraryId)
+    libraryPanelOpen.value = false
+    statusMessage.value =
+      bindingResult === 'bound_current_session'
+        ? '已为当前会话配置文献库。'
+        : bindingResult === 'already_bound'
+          ? '当前会话已使用该文献库。'
+          : '已选择文献库，发送后将绑定到新会话。'
+  } catch (error) {
+    errorMessage.value = extractErrorMessage(error, '配置当前会话文献库失败。')
   }
-
-  applyLibrarySelection(libraryId)
-  libraryPanelOpen.value = false
-  statusMessage.value = switchingSessionLibrary
-    ? '已切换文献库，下一条消息将创建新会话。'
-    : '已选择当前文献库。'
 }
 
 async function createLibraryWithFolder() {
@@ -774,11 +823,17 @@ async function createLibraryWithFolder() {
     const createdLibraryId = payload.library?.id ?? null
     if (createdLibraryId !== null) {
       panelSelectedLibraryId.value = createdLibraryId
-      applyLibrarySelection(createdLibraryId)
+      if (activeSessionId.value === null || activeLibraryId.value === null) {
+        await bindLibraryToCurrentSession(createdLibraryId)
+      }
     }
     libraryPanelOpen.value = false
     if (createdLibraryId !== null) {
-      await syncLibraryInBackground()
+      if (activeLibraryId.value === createdLibraryId) {
+        await syncLibraryInBackground()
+      } else {
+        await syncLibraryEntry(createdLibraryId)
+      }
     }
   } catch (error) {
     errorMessage.value = error instanceof Error ? error.message : '创建文献库时发生未知错误。'
@@ -797,6 +852,7 @@ onMounted(async () => {
 
 onBeforeUnmount(() => {
   syncJobPollToken += 1
+  stopPreparationTimer()
   document.removeEventListener('pointerdown', handleDocumentPointerDown)
 })
 
@@ -859,12 +915,6 @@ function syncActiveLibrarySelection() {
     }
   }
 
-  const firstLibrary = libraries.value[0]
-  if (firstLibrary) {
-    applyLibrarySelection(firstLibrary.id)
-    return
-  }
-
   applyLibrarySelection(null)
 }
 
@@ -907,6 +957,7 @@ function startNewSession() {
   currentGoal.value = ''
   messages.value = []
   inputValue.value = ''
+  applyLibrarySelection(null)
   clearFeedback()
 }
 
@@ -1294,12 +1345,6 @@ async function sendMessage() {
     return
   }
 
-  if (activeLibraryId.value === null) {
-    clearFeedback()
-    errorMessage.value = '请先配置文献库。'
-    return
-  }
-
   clearFeedback()
   isSending.value = true
 
@@ -1411,10 +1456,6 @@ async function ensureActiveSession(seedText: string) {
     return activeSessionId.value
   }
 
-  if (activeLibraryId.value === null) {
-    throw new Error('请先配置文献库。')
-  }
-
   const title = buildSessionTitle(seedText)
   const payload = await postJson<{ success: boolean; session: SessionSummary }>('/api/sessions', {
     title,
@@ -1424,7 +1465,7 @@ async function ensureActiveSession(seedText: string) {
 
   activeSessionId.value = payload.session.id
   currentGoal.value = payload.session.user_goal
-  applyLibrarySelection(payload.session.library_id)
+  applyLibrarySelection(payload.session.library_id ?? null)
   await refreshSessions()
   return payload.session.id
 }
@@ -1437,7 +1478,6 @@ async function streamChatResponse(sessionId: number, userMessage: string, assist
     },
     body: JSON.stringify({
       message: userMessage,
-      top_k: sessionModelConfig.value.rerankChunks,
       allow_external_search: externalSearchEnabled.value,
     }),
   })
@@ -1539,6 +1579,44 @@ function parseSsePayload(rawBlock: string): unknown | null {
 }
 
 async function applyStreamEvent(event: StreamEvent, assistantMessage: UiMessage) {
+  if (event.type === 'prepare_start') {
+    assistantMessage.preparation = {
+      status: 'thinking',
+      expanded: true,
+      startedAt: Date.now(),
+      elapsedSeconds: null,
+      steps: [],
+    }
+    startPreparationTimer()
+    await flushStreamFrame()
+    return
+  }
+
+  if (event.type === 'prepare_step') {
+    const preparation = ensureMessagePreparation(assistantMessage)
+    const incomingStep = mapPreparationStep(event.step)
+    const existingIndex = preparation.steps.findIndex((step) => step.id === incomingStep.id)
+    if (existingIndex >= 0) {
+      preparation.steps.splice(existingIndex, 1, {
+        ...preparation.steps[existingIndex],
+        ...incomingStep,
+      })
+    } else {
+      preparation.steps.push(incomingStep)
+    }
+    await flushStreamFrame()
+    return
+  }
+
+  if (event.type === 'prepare_done') {
+    const preparation = ensureMessagePreparation(assistantMessage)
+    preparation.status = 'done'
+    preparation.elapsedSeconds = Number(event.elapsed_seconds ?? 0)
+    stopPreparationTimer()
+    await flushStreamFrame()
+    return
+  }
+
   if (event.type === 'meta') {
     assistantMessage.retrievedDocuments = event.retrieved_documents ?? []
     assistantMessage.retrievedMemories = event.retrieved_memories ?? []
@@ -1554,13 +1632,158 @@ async function applyStreamEvent(event: StreamEvent, assistantMessage: UiMessage)
   if (event.type === 'done') {
     assistantMessage.content = event.answer ?? assistantMessage.content
     assistantMessage.citations = event.citations ?? []
+    stopPreparationTimer()
     await flushStreamFrame()
     return
   }
 
   if (event.type === 'error') {
+    stopPreparationTimer()
     throw new Error(event.message || '流式输出失败')
   }
+}
+
+function startPreparationTimer() {
+  preparationTicker.value = Date.now()
+  if (preparationTimerId !== null) {
+    return
+  }
+
+  preparationTimerId = window.setInterval(() => {
+    preparationTicker.value = Date.now()
+  }, 1000)
+}
+
+function stopPreparationTimer() {
+  if (preparationTimerId === null) {
+    return
+  }
+
+  window.clearInterval(preparationTimerId)
+  preparationTimerId = null
+}
+
+function ensureMessagePreparation(message: UiMessage) {
+  if (!message.preparation) {
+    message.preparation = {
+      status: 'thinking',
+      expanded: true,
+      startedAt: Date.now(),
+      elapsedSeconds: null,
+      steps: [],
+    }
+  }
+  return message.preparation
+}
+
+function mapPreparationStep(step: StreamPrepareStepPayload): MessagePreparationStep {
+  return {
+    id: step.id || `${step.source}-${step.query}`,
+    status: step.status || 'running',
+    source: step.source || 'arxiv',
+    query: step.query || '',
+    sortBy: step.sort_by || 'relevance',
+    sortOrder: step.sort_order || 'descending',
+    resultCount: step.result_count,
+    error: step.error || '',
+  }
+}
+
+function mapPersistedPreparation(payload: unknown): MessagePreparation | undefined {
+  if (!payload || typeof payload !== 'object') {
+    return undefined
+  }
+
+  const preparationPayload = payload as PersistedPreparation
+  const elapsedSeconds =
+    typeof preparationPayload.elapsed_seconds === 'number' && Number.isFinite(preparationPayload.elapsed_seconds)
+      ? preparationPayload.elapsed_seconds
+      : null
+  const steps = Array.isArray(preparationPayload.steps)
+    ? preparationPayload.steps.map(mapPersistedPreparationStep)
+    : []
+
+  return {
+    status: 'done',
+    expanded: false,
+    startedAt: Date.now() - Math.max(0, elapsedSeconds ?? 0) * 1000,
+    elapsedSeconds,
+    steps,
+  }
+}
+
+function mapPersistedPreparationStep(step: PersistedPreparationStep): MessagePreparationStep {
+  return {
+    id: step.id || `${step.source || 'arxiv'}-${step.query || ''}`,
+    status: normalizePreparationStepStatus(step.status),
+    source: step.source || 'arxiv',
+    query: step.query || '',
+    sortBy: step.sort_by || 'relevance',
+    sortOrder: step.sort_order || 'descending',
+    resultCount: step.result_count,
+    error: step.error || '',
+  }
+}
+
+function normalizePreparationStepStatus(status: PreparationStepStatus | undefined): PreparationStepStatus {
+  if (status === 'running' || status === 'success' || status === 'error') {
+    return status
+  }
+  return 'success'
+}
+
+function togglePreparation(message: UiMessage) {
+  if (!message.preparation) {
+    return
+  }
+  message.preparation.expanded = !message.preparation.expanded
+}
+
+function getPreparationTitle(message: UiMessage) {
+  const preparation = message.preparation
+  if (!preparation || preparation.status === 'thinking') {
+    const startedAt = preparation?.startedAt ?? Date.now()
+    const elapsedSeconds = (preparationTicker.value - startedAt) / 1000
+    return `正在思考 ${formatThinkingElapsedSeconds(elapsedSeconds)}s`
+  }
+  const elapsedSeconds = preparation.elapsedSeconds ?? (Date.now() - preparation.startedAt) / 1000
+  return `已思考（用时${formatElapsedSeconds(elapsedSeconds)}秒）`
+}
+
+function formatThinkingElapsedSeconds(value: number) {
+  if (!Number.isFinite(value)) {
+    return '0'
+  }
+  return String(Math.max(0, Math.floor(value)))
+}
+
+function formatElapsedSeconds(value: number) {
+  if (!Number.isFinite(value)) {
+    return '0.0'
+  }
+  return Math.max(0, value).toFixed(1)
+}
+
+function formatPreparationStep(step: MessagePreparationStep) {
+  if (step.source === 'library') {
+    const libraryName = step.query || '当前文献库'
+    if (step.status === 'success') {
+      return `文献库 ${libraryName} 检索到${step.resultCount ?? 0}篇文献`
+    }
+    if (step.status === 'error') {
+      return `文献库 ${libraryName} 检索失败：${step.error || '未知错误'}`
+    }
+    return `正在检索文献库 ${libraryName}`
+  }
+
+  const sortText = `${step.sortBy}${step.sortOrder ? `/${step.sortOrder}` : ''}`
+  if (step.status === 'success') {
+    return `${step.source}检索到${step.resultCount ?? 0}篇文献：${step.query || '未命名查询'}和${step.sortBy || 'relevance'}`
+  }
+  if (step.status === 'error') {
+    return `${step.source} 检索失败：${step.error || '未知错误'}`
+  }
+  return `正在检索 ${step.source}：${step.query || '未命名查询'}；排序方式：${sortText}`
 }
 
 async function flushStreamFrame() {
@@ -1576,60 +1799,6 @@ async function flushStreamFrame() {
 function buildSessionTitle(text: string) {
   const compact = text.replace(/\s+/g, ' ').trim()
   return compact.length > 24 ? `${compact.slice(0, 24)}...` : compact || '新建论文会话'
-}
-
-function openFilePicker() {
-  fileInputRef.value?.click()
-}
-
-async function handleFileChange(event: Event) {
-  const input = event.target as HTMLInputElement
-  const files = input.files ? Array.from(input.files) : []
-
-  clearFeedback()
-
-  if (activeLibraryId.value === null) {
-    errorMessage.value = '请先配置文献库。'
-    input.value = ''
-    selectedFileNames.value = []
-    return
-  }
-
-  if (files.length === 0) {
-    selectedFileNames.value = []
-    return
-  }
-
-  selectedFileNames.value = files.map((file) => file.name)
-  uploading.value = true
-
-  try {
-    const formData = new FormData()
-    for (const file of files) {
-      formData.append('files', file)
-    }
-    formData.append('library_id', String(activeLibraryId.value))
-
-    const response = await fetch(`${API_BASE_URL}/api/upload-papers`, {
-      method: 'POST',
-      body: formData,
-    })
-
-    const payload = await response.json()
-    if (!response.ok || !payload.success) {
-      throw new Error(payload.detail || payload.message || '上传失败')
-    }
-
-    statusMessage.value = payload.message
-    uploadedFiles.value = payload.saved_files ?? []
-    await refreshLibraries()
-    applyLibrarySelection(activeLibraryId.value)
-  } catch (error) {
-    errorMessage.value = extractErrorMessage(error, '上传失败')
-  } finally {
-    uploading.value = false
-    input.value = ''
-  }
 }
 
 function buildLibraryNameFromPath(folderPath: string) {
@@ -1859,6 +2028,7 @@ function mapMessageFromApi(message: SessionMessage): UiMessage {
   let retrievedDocuments: RetrievedDocument[] = []
   let retrievedMemories: RetrievedMemory[] = []
   let citations: CitationBinding[] = []
+  let preparation: MessagePreparation | undefined
 
   if (message.retrieval_context_json) {
     try {
@@ -1866,14 +2036,17 @@ function mapMessageFromApi(message: SessionMessage): UiMessage {
         documents?: RetrievedDocument[]
         memories?: RetrievedMemory[]
         citations?: CitationBinding[]
+        preparation?: unknown
       }
       retrievedDocuments = context.documents ?? []
       retrievedMemories = context.memories ?? []
       citations = context.citations ?? []
+      preparation = mapPersistedPreparation(context.preparation)
     } catch {
       retrievedDocuments = []
       retrievedMemories = []
       citations = []
+      preparation = undefined
     }
   }
 
@@ -1886,6 +2059,7 @@ function mapMessageFromApi(message: SessionMessage): UiMessage {
     retrievedDocuments,
     retrievedMemories,
     citations,
+    preparation,
   }
 }
 
@@ -1922,7 +2096,10 @@ function formatTime(value: string) {
 
 function renderMessageContent(message: UiMessage) {
   if (message.role === 'assistant') {
-    const { body } = splitReferenceSection(message.content || '思考中...')
+    if (message.preparation && !message.content.trim()) {
+      return ''
+    }
+    const { body } = splitReferenceSection(message.content || '正在思考 0s')
     return renderMarkdownToHtml(body)
   }
   return escapeHtml(message.content || '')
@@ -2073,14 +2250,16 @@ function renderMarkdownToHtml(markdown: string) {
       continue
     }
 
-    const orderedMatch = line.match(/^\d+\.\s+(.*)$/)
+    const orderedMatch = line.match(/^(\d+)\.\s+(.*)$/)
     if (orderedMatch) {
       if (listType !== 'ol') {
         closeList()
         listType = 'ol'
         htmlParts.push('<ol>')
       }
-      htmlParts.push(`<li>${applyInlineMarkdown(orderedMatch[1] ?? '')}</li>`)
+      const orderedNumber = orderedMatch[1] ?? '1'
+      const orderedText = orderedMatch[2] ?? ''
+      htmlParts.push(`<li value="${orderedNumber}">${applyInlineMarkdown(orderedText)}</li>`)
       continue
     }
 
@@ -2112,7 +2291,14 @@ function applyInlineMarkdown(text: string) {
     .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
     .replace(/\*([^*]+)\*/g, '<em>$1</em>')
     .replace(/`([^`]+)`/g, '<code>$1</code>')
-    .replace(/\[(\d+)\]/g, '<button class="citation-link" data-ref-number="$1">[$1]</button>')
+    .replace(/\[((?:\d+)(?:\s*[,，]\s*\d+)*)\]/g, (_match, numbers: string) =>
+      numbers
+        .split(/[，,]/)
+        .map((number) => number.trim())
+        .filter(Boolean)
+        .map((number) => `<button class="citation-link" data-ref-number="${number}">[${number}]</button>`)
+        .join(''),
+    )
 }
 
 function escapeHtml(text: string) {
@@ -2435,7 +2621,7 @@ function isReferenceExpanded(messageId: number, referenceNumber: number) {
           <p class="hero-kicker">RAG Paper Assistant</p>
           <h1>从本地文献库出发，进入真正可持续的论文助手工作流。</h1>
           <!-- <p class="hero-description">
-            发送第一条消息后会自动创建会话并切换到聊天页。新建会话则会回到当前首页，你可以重新选择提示词、上传文献或同步本地文献文件夹。
+            发送第一条消息后会自动创建会话并切换到聊天页。新建会话则会回到当前首页，你可以重新选择提示词或同步本地文献文件夹。
           </p> -->
         </div>
 
@@ -2497,20 +2683,6 @@ function isReferenceExpanded(messageId: number, referenceNumber: number) {
         </div>
         <div v-if="errorMessage" class="status-box status-box--error">{{ errorMessage }}</div>
 
-        <div v-if="selectedFileNames.length" class="attachment-strip">
-          <span class="attachment-strip__label">已选择附件</span>
-          <div class="attachment-tags">
-            <span v-for="name in selectedFileNames" :key="name" class="attachment-tag">{{ name }}</span>
-          </div>
-        </div>
-
-        <div v-if="uploadedFiles.length && isHomeView" class="uploaded-list">
-          <div v-for="file in uploadedFiles" :key="file.path" class="uploaded-item">
-            <strong>{{ file.name }}</strong>
-            <span>{{ file.path }}</span>
-          </div>
-        </div>
-
         <div
           v-if="!isHomeView || hasMessages || isLoadingMessages"
           ref="messageStreamRef"
@@ -2531,6 +2703,33 @@ function isReferenceExpanded(messageId: number, referenceNumber: number) {
                 <strong class="message-bubble__role">{{ message.role === 'user' ? '你' : '论文助手' }}</strong>
                 <span class="message-bubble__time">{{ formatTime(message.createdAt) }}</span>
               </div> -->
+
+              <div
+                v-if="message.role === 'assistant' && message.preparation"
+                class="preparation-panel"
+              >
+                <button class="preparation-toggle" type="button" @click="togglePreparation(message)">
+                  <span class="evidence-block__label">{{ getPreparationTitle(message) }}</span>
+                  <span class="preparation-toggle__arrow">
+                    {{ message.preparation.expanded ? '⌄' : '>' }}
+                  </span>
+                </button>
+                <div v-if="message.preparation.expanded" class="preparation-steps">
+                  <div v-if="!message.preparation.steps.length" class="preparation-step preparation-step--running">
+                    <span class="preparation-step__dot" />
+                    <span>正在准备检索任务...</span>
+                  </div>
+                  <div
+                    v-for="step in message.preparation.steps"
+                    :key="step.id"
+                    class="preparation-step"
+                    :class="`preparation-step--${step.status}`"
+                  >
+                    <span class="preparation-step__dot" />
+                    <span>{{ formatPreparationStep(step) }}</span>
+                  </div>
+                </div>
+              </div>
 
               <div
                 class="message-bubble__content"
@@ -2652,34 +2851,8 @@ function isReferenceExpanded(messageId: number, referenceNumber: number) {
             @keydown.enter.exact.prevent="sendMessage"
           />
 
-          <input
-            ref="fileInputRef"
-            class="file-input"
-            type="file"
-            accept=".pdf"
-            multiple
-            @change="handleFileChange"
-          />
-
           <div class="composer__actions">
             <div class="composer__left">
-              <button class="attach-button" type="button" :disabled="uploading" @click="openFilePicker">
-                {{ uploading ? '上传中...' : '上传附件' }}
-              </button>
-              <button v-if="isHomeView" class="folder-button" type="button" :disabled="configuringFolder" @click="openLibraryManagementPanel">
-                <span class="action-button-label">{{ configuringFolder ? '配置中...' : '配置文献库' }}</span>
-                {{ configuringFolder ? '配置中...' : '配置文件夹' }}
-              </button>
-              <button v-if="!isHomeView" class="sync-button" type="button" :disabled="syncing || !activeLibraryId" @click="syncLibraryInBackground">
-                <span class="action-button-label">{{ syncing ? '同步中...' : '同步文献库' }}</span>
-                {{ syncing ? '同步中...' : '同步文件夹' }}
-              </button>
-              <span v-if="activeLibraryName && !isHomeView" class="library-name-chip">{{ activeLibraryName }}</span>
-              <!-- <button class="sync-button" type="button" :disabled="debugStreaming" @click="runDebugStreamProbe">
-                {{ debugStreaming ? '调试中...' : '调试流式' }}
-              </button> -->
-            </div>
-            <div class="composer__right">
               <button
                 class="external-search-button"
                 type="button"
@@ -2691,7 +2864,20 @@ function isReferenceExpanded(messageId: number, referenceNumber: number) {
               >
                 联网搜索
               </button>
-
+              <button v-if="isHomeView || !hasComposerLibrary" class="folder-button" type="button" :disabled="configuringFolder" @click="openLibraryManagementPanel">
+                <span class="action-button-label">{{ configuringFolder ? '配置中...' : '配置文献库' }}</span>
+                {{ configuringFolder ? '配置中...' : '配置文件夹' }}
+              </button>
+              <button v-else class="sync-button" type="button" :disabled="syncing || !activeLibraryId" @click="syncLibraryInBackground">
+                <span class="action-button-label">{{ syncing ? '同步中...' : '同步文献库' }}</span>
+                {{ syncing ? '同步中...' : '同步文件夹' }}
+              </button>
+              <span v-if="activeLibraryName" class="library-name-chip">{{ activeLibraryName }}</span>
+              <!-- <button class="sync-button" type="button" :disabled="debugStreaming" @click="runDebugStreamProbe">
+                {{ debugStreaming ? '调试中...' : '调试流式' }}
+              </button> -->
+            </div>
+            <div class="composer__right">
               <button class="send-button" type="button" :disabled="!canSend" @click="sendMessage">
                 {{ isSending ? '生成中...' : '发送' }}
               </button>
@@ -2933,7 +3119,7 @@ function isReferenceExpanded(messageId: number, referenceNumber: number) {
             :disabled="panelSelectedLibraryId === null"
             @click="useSelectedLibraryForChat"
           >
-            {{ activeSessionId !== null ? '用于新会话' : '使用该文献库' }}
+            用于当前会话
           </button>
         </div>
         <p v-if="panelSelectedLibrary" class="library-panel__path">
@@ -3185,44 +3371,6 @@ function isReferenceExpanded(messageId: number, referenceNumber: number) {
             </div>
           </section>
 
-          <section class="model-config-card">
-            <div class="model-config-card__head">
-              <div>
-                <h5>会话配置</h5>
-                <p>控制检索与重排阶段的候选块规模。</p>
-              </div>
-            </div>
-
-            <div class="model-config-fields">
-              <label class="library-panel__field" :class="{ 'library-panel__field--error': !!modelConfigFieldErrors.recallChunks }">
-                <span>召回块数</span>
-                <input
-                  v-model.number="sessionModelConfig.recallChunks"
-                  type="number"
-                  min="1"
-                  step="1"
-                  placeholder="20"
-                  @input="modelConfigFieldErrors.recallChunks = ''"
-                />
-                <small v-if="modelConfigFieldErrors.recallChunks" class="library-panel__field-error">{{ modelConfigFieldErrors.recallChunks }}</small>
-                <small class="model-config__hint">向量检索阶段初次召回的候选 chunk 数。</small>
-              </label>
-
-              <label class="library-panel__field" :class="{ 'library-panel__field--error': !!modelConfigFieldErrors.rerankChunks }">
-                <span>重排块数</span>
-                <input
-                  v-model.number="sessionModelConfig.rerankChunks"
-                  type="number"
-                  min="1"
-                  step="1"
-                  placeholder="5"
-                  @input="modelConfigFieldErrors.rerankChunks = ''"
-                />
-                <small v-if="modelConfigFieldErrors.rerankChunks" class="library-panel__field-error">{{ modelConfigFieldErrors.rerankChunks }}</small>
-                <small class="model-config__hint">重排后真正送入回答生成阶段的 chunk 数。</small>
-              </label>
-            </div>
-          </section>
         </div>
 
         <div class="model-config-actions">
@@ -3306,7 +3454,6 @@ function isReferenceExpanded(messageId: number, referenceNumber: number) {
 .send-button,
 .history-item__body,
 .history-menu-button,
-.attach-button,
 .folder-button,
 .sync-button,
 .new-session-button {
@@ -3580,7 +3727,6 @@ function isReferenceExpanded(messageId: number, referenceNumber: number) {
 
 .history-time,
 .hero-description,
-.uploaded-item span,
 .desktop-badge,
 .empty-state {
   margin: 0;
@@ -3777,8 +3923,6 @@ function isReferenceExpanded(messageId: number, referenceNumber: number) {
 }
 
 .goal-panel,
-.attachment-strip,
-.uploaded-list,
 .status-box,
 .folder-panel,
 .message-stream {
@@ -3832,40 +3976,6 @@ function isReferenceExpanded(messageId: number, referenceNumber: number) {
 .status-box--error {
   background: rgba(239, 68, 68, 0.1);
   color: #b91c1c;
-}
-
-.attachment-strip__label {
-  display: block;
-  margin-bottom: 0.65rem;
-  color: #475569;
-  font-size: 0.92rem;
-}
-
-.attachment-tags {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 0.6rem;
-}
-
-.attachment-tag {
-  padding: 0.4rem 0.8rem;
-  border-radius: 999px;
-  background: rgba(37, 99, 235, 0.08);
-  color: #1d4ed8;
-  font-size: 0.9rem;
-}
-
-.uploaded-list {
-  display: grid;
-  gap: 0.75rem;
-}
-
-.uploaded-item {
-  display: grid;
-  gap: 0.25rem;
-  padding: 0.9rem 1rem;
-  border-radius: 18px;
-  background: rgba(248, 250, 252, 0.94);
 }
 
 .message-stream {
@@ -4018,6 +4128,68 @@ function isReferenceExpanded(messageId: number, referenceNumber: number) {
 
 .message-bubble__content :deep(.citation-link:hover) {
   background: rgba(37, 99, 235, 0.2);
+}
+
+.preparation-panel {
+  display: grid;
+  gap: 0.55rem;
+  margin-top: 0.1rem;
+}
+
+.preparation-toggle {
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 0.4rem;
+  width: fit-content;
+  padding: 0;
+  border: none;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  font: inherit;
+}
+
+.preparation-toggle__arrow {
+  color: #94a3b8;
+  font-size: 0.86rem;
+  line-height: 1;
+}
+
+.preparation-steps {
+  display: grid;
+  gap: 0.45rem;
+  color: #64748b;
+  font-size: 0.88rem;
+}
+
+.preparation-step {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.45rem;
+  line-height: 1.6;
+}
+
+.preparation-step__dot {
+  width: 0.42rem;
+  height: 0.42rem;
+  margin-top: 0.52rem;
+  flex-shrink: 0;
+  border-radius: 999px;
+  background: #94a3b8;
+}
+
+.preparation-step--running .preparation-step__dot {
+  background: #2563eb;
+  box-shadow: 0 0 0 4px rgba(37, 99, 235, 0.08);
+}
+
+.preparation-step--success .preparation-step__dot {
+  background: #16a34a;
+}
+
+.preparation-step--error .preparation-step__dot {
+  background: #dc2626;
 }
 
 .message-bubble--user .message-bubble__content :deep(code) {
@@ -4209,10 +4381,6 @@ function isReferenceExpanded(messageId: number, referenceNumber: number) {
   line-height: 1.7;
 }
 
-.file-input {
-  display: none;
-}
-
 .composer__actions,
 .composer__left {
   display: flex;
@@ -4232,7 +4400,6 @@ function isReferenceExpanded(messageId: number, referenceNumber: number) {
   padding-top: 0.75rem;
 }
 
-.attach-button,
 .folder-button,
 .sync-button {
   padding: 0.72rem 1rem;
@@ -4259,11 +4426,6 @@ function isReferenceExpanded(messageId: number, referenceNumber: number) {
   white-space: nowrap;
 }
 
-.attach-button {
-  background: rgba(37, 99, 235, 0.08);
-  color: #1d4ed8;
-}
-
 .folder-button {
   background: rgba(124, 58, 237, 0.08);
   color: #7c3aed;
@@ -4285,13 +4447,16 @@ function isReferenceExpanded(messageId: number, referenceNumber: number) {
 }
 
 .external-search-button {
-  padding: 0.72rem 1rem;
-  border: 1px solid rgba(14, 116, 144, 0.22);
+  box-sizing: border-box;
+  padding: calc(0.72rem - 1px) calc(1rem - 1px);
+  border: 1px solid rgba(148, 163, 184, 0.42);
   border-radius: 999px;
-  background: rgba(14, 116, 144, 0.08);
-  color: #0f766e;
+  background: #fff;
+  color: #475569;
   cursor: pointer;
   font: inherit;
+  font-size: 0.94rem;
+  line-height: 1.1;
   transition:
     background 0.18s ease,
     border-color 0.18s ease,
@@ -4300,13 +4465,12 @@ function isReferenceExpanded(messageId: number, referenceNumber: number) {
 }
 
 .external-search-button--active {
-  border-color: rgba(14, 116, 144, 0.44);
-  background: #0f766e;
-  color: #fff;
+  border-color: #2563eb;
+  background: rgba(37, 99, 235, 0.1);
+  color: #1d4ed8;
 }
 
 .send-button:disabled,
-.attach-button:disabled,
 .folder-button:disabled,
 .sync-button:disabled,
 .external-search-button:disabled {
@@ -4315,7 +4479,6 @@ function isReferenceExpanded(messageId: number, referenceNumber: number) {
 }
 
 .send-button:not(:disabled):hover,
-.attach-button:not(:disabled):hover,
 .folder-button:not(:disabled):hover,
 .sync-button:not(:disabled):hover,
 .external-search-button:not(:disabled):hover,
@@ -4465,16 +4628,6 @@ function isReferenceExpanded(messageId: number, referenceNumber: number) {
   box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.04);
 }
 
-.chat-stage--home .uploaded-list {
-  gap: 0.6rem;
-}
-
-.chat-stage--home .uploaded-item {
-  padding: 0.8rem 0.9rem;
-  border-radius: 16px;
-  background: rgba(248, 250, 252, 0.72);
-}
-
 .chat-stage--home .composer {
   margin-top: 0.75rem;
   padding: 0.82rem 0.85rem;
@@ -4491,7 +4644,6 @@ function isReferenceExpanded(messageId: number, referenceNumber: number) {
   padding-top: 0.68rem;
 }
 
-.chat-stage--home .attach-button,
 .chat-stage--home .folder-button,
 .chat-stage--home .sync-button {
   padding: 0.68rem 0.92rem;
@@ -4831,7 +4983,6 @@ function isReferenceExpanded(messageId: number, referenceNumber: number) {
   padding-top: 0.65rem;
 }
 
-.chat-stage--session .attach-button,
 .chat-stage--session .folder-button,
 .chat-stage--session .sync-button {
   padding: 0.68rem 0.92rem;

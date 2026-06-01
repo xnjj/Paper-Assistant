@@ -118,7 +118,7 @@ class SessionRecord:
     """会话记录。"""
 
     id: int
-    library_id: int
+    library_id: int | None
     title: str
     user_goal: str
     is_pinned: bool

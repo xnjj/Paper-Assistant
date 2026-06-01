@@ -96,7 +96,7 @@ CREATE TABLE IF NOT EXISTS library_sync_items (
 
 CREATE TABLE IF NOT EXISTS chat_sessions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    library_id INTEGER NOT NULL,
+    library_id INTEGER,
     title TEXT NOT NULL,
     user_goal TEXT NOT NULL,
     is_pinned INTEGER NOT NULL DEFAULT 0,
@@ -152,6 +152,7 @@ class DatabaseManager:
         self._migrate_documents(connection, migration_library_id)
         self._ensure_document_metadata_columns(connection)
         self._ensure_session_columns(connection, migration_library_id)
+        self._ensure_session_library_nullable(connection)
         self._ensure_sync_job_columns(connection, migration_library_id)
         self._ensure_chunk_columns(connection, migration_library_id)
 
@@ -315,6 +316,39 @@ class DatabaseManager:
                     "UPDATE chat_sessions SET library_id = ? WHERE library_id = 0",
                     (migration_library_id,),
                 )
+
+    def _ensure_session_library_nullable(self, connection: sqlite3.Connection) -> None:
+        """允许会话不绑定文献库，必要时重建旧的 NOT NULL 会话表。"""
+        session_columns = connection.execute("PRAGMA table_info(chat_sessions)").fetchall()
+        library_column = next((row for row in session_columns if row[1] == "library_id"), None)
+        if library_column is None or int(library_column[3]) == 0:
+            return
+
+        connection.execute(
+            """
+            CREATE TABLE chat_sessions_new (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                library_id INTEGER,
+                title TEXT NOT NULL,
+                user_goal TEXT NOT NULL,
+                is_pinned INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY(library_id) REFERENCES libraries(id)
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO chat_sessions_new(
+                id, library_id, title, user_goal, is_pinned, created_at, updated_at
+            )
+            SELECT id, library_id, title, user_goal, is_pinned, created_at, updated_at
+            FROM chat_sessions
+            """
+        )
+        connection.execute("DROP TABLE chat_sessions")
+        connection.execute("ALTER TABLE chat_sessions_new RENAME TO chat_sessions")
 
     def _ensure_sync_job_columns(self, connection: sqlite3.Connection, migration_library_id: int | None) -> None:
         """Add library ownership to historical sync jobs."""
