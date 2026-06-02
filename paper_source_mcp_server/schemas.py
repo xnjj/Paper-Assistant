@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
+import config_data as config
+
 
 @dataclass
 class ExternalPaperRecord:
@@ -19,6 +21,7 @@ class ExternalPaperRecord:
     abstract: str = ""
     pdf_url: str = ""
     relevance_score: float | None = None
+    published_at: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         """把论文记录转换为字典。"""
@@ -48,12 +51,12 @@ class ExternalFulltextRecord:
 class SearchExternalPapersArgs:
     """定义 `search_external_papers` 工具的输入参数。"""
 
-    query: str
-    limit: int = 10
-    year_from: int | None = None
-    sort_by: str = "relevance"
-    sort_order: str = "descending"
-    sources: list[str] = field(default_factory=lambda: ["arxiv"])
+    query: list[str]
+    limit: int = config.MAX_EXTERNAL_QUERY_LIMIT
+    date_from: str | None = None
+    sortby: str = "relevance"
+    orderby: str = "descending"
+    sources: list[str] = field(default_factory=lambda: ["arxiv", "openalex"])
 
 
 @dataclass
@@ -85,15 +88,30 @@ def build_tool_schemas() -> list[dict[str, Any]]:
             "input_schema": {
                 "type": "object",
                 "properties": {
-                    "query": {"type": "string", "description": "用户查询词"},
-                    "limit": {"type": "integer", "default": 10, "minimum": 1, "maximum": 50},
-                    "year_from": {"type": ["integer", "null"], "description": "年份下限"},
-                    "sort_by": {
+                    "query": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "minItems": 1,
+                        "maxItems": 4,
+                        "description": "检索关键词或短语列表，最多 4 个；不要包含 all:、AND、OR 等数据源语法",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "default": config.MAX_EXTERNAL_QUERY_LIMIT,
+                        "minimum": 1,
+                        "maximum": config.MAX_EXTERNAL_QUERY_LIMIT,
+                        "description": "单个数据源单次请求最多返回的论文数量",
+                    },
+                    "date_from": {
+                        "type": ["string", "null"],
+                        "description": "日期下限，格式为 yyyymmdd，例如 20240101",
+                    },
+                    "sortby": {
                         "type": "string",
                         "default": "relevance",
-                        "description": "排序字段，例如 relevance 或 submittedDate",
+                        "description": "通用排序字段，例如 relevance 或 submittedDate；provider 可按自身策略解释",
                     },
-                    "sort_order": {
+                    "orderby": {
                         "type": "string",
                         "default": "descending",
                         "description": "排序顺序，例如 ascending 或 descending",
@@ -101,8 +119,8 @@ def build_tool_schemas() -> list[dict[str, Any]]:
                     "sources": {
                         "type": "array",
                         "items": {"type": "string"},
-                        "default": ["arxiv"],
-                        "description": "需要检索的外部来源列表",
+                        "default": ["arxiv", "openalex"],
+                        "description": "需要检索的外部来源列表，例如 arxiv、openalex",
                     },
                 },
                 "required": ["query"],
@@ -114,7 +132,7 @@ def build_tool_schemas() -> list[dict[str, Any]]:
             "input_schema": {
                 "type": "object",
                 "properties": {
-                    "source": {"type": "string", "description": "外部来源名称，如 arxiv"},
+                    "source": {"type": "string", "description": "外部来源名称，如 arxiv、openalex"},
                     "external_id": {"type": "string", "description": "来源内部的论文标识"},
                 },
                 "required": ["source", "external_id"],
@@ -126,7 +144,7 @@ def build_tool_schemas() -> list[dict[str, Any]]:
             "input_schema": {
                 "type": "object",
                 "properties": {
-                    "source": {"type": "string", "description": "外部来源名称，如 arxiv"},
+                    "source": {"type": "string", "description": "外部来源名称，如 arxiv、openalex"},
                     "external_id": {"type": "string", "description": "来源内部的论文标识"},
                     "title": {"type": "string", "default": ""},
                     "doi": {"type": "string", "default": ""},

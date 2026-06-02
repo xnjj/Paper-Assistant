@@ -270,6 +270,7 @@ class AgentOrchestratorService:
                 )
             )
             external_documents = self._prepare_external_documents(local_documents, external_candidates)
+            external_documents = self._rerank_external_documents(user_message, external_documents)
             if library is not None:
                 pending_ingest = self.decide_ingest_candidates(
                     library_id=library.id,
@@ -737,6 +738,7 @@ class AgentOrchestratorService:
             "query": str(event.get("query") or ""),
             "sort_by": str(event.get("sort_by") or "relevance"),
             "sort_order": str(event.get("sort_order") or "descending"),
+            "request_url": str(event.get("request_url") or ""),
             "result_count": event.get("result_count"),
             "error": str(event.get("error") or ""),
         }
@@ -799,18 +801,41 @@ class AgentOrchestratorService:
         return ExternalSearchPlan(
             queries=[
                 ExternalSearchQueryPlan(
-                    query=query,
-                    limit=min(max(limit, 1), config.DEFAULT_EXTERNAL_FINAL_LIMIT),
-                    year_from=2024 if freshness_requested else None,
-                    sort_by="submittedDate" if freshness_requested else "relevance",
-                    sort_order="descending",
-                    sources=["arxiv"],
+                    query=self._build_fallback_external_keywords(query),
+                    limit=min(max(limit, 1), config.MAX_EXTERNAL_QUERY_LIMIT),
+                    date_from="20240101" if freshness_requested else None,
+                    sortby="submittedDate" if freshness_requested else "relevance",
+                    orderby="descending",
+                    sources=["arxiv", "openalex"],
                 )
             ],
             final_limit=config.DEFAULT_EXTERNAL_FINAL_LIMIT,
             rationale="Fallback search plan.",
             planned_by_model=False,
         )
+
+    def _build_fallback_external_keywords(self, query: str) -> list[str]:
+        """在没有外部检索规划器时，从用户问题中提取保守的通用关键词列表。"""
+        normalized = re.sub(r"\s+", " ", (query or "").strip())
+        if not normalized:
+            return ["paper"]
+
+        keywords: list[str] = []
+        quoted_phrases = re.findall(r'["“”‘’\']([^"“”‘’\']{2,80})["“”‘’\']', normalized)
+        for phrase in quoted_phrases:
+            keyword = re.sub(r"\s+", " ", phrase.strip())
+            if keyword and keyword not in keywords:
+                keywords.append(keyword)
+
+        english_terms = re.findall(r"[A-Za-z][A-Za-z0-9 -]{1,48}", normalized)
+        for term in english_terms:
+            keyword = re.sub(r"\s+", " ", term.strip())
+            if keyword and keyword.lower() not in {"and", "or", "the", "for"} and keyword not in keywords:
+                keywords.append(keyword)
+            if len(keywords) >= 4:
+                break
+
+        return keywords[:4] or [normalized[:80]]
 
     def _prepare_external_documents(
         self,
@@ -850,6 +875,20 @@ class AgentOrchestratorService:
                 }
             )
         return prepared
+
+    def _rerank_external_documents(
+        self,
+        user_message: str,
+        external_documents: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """对不同外部数据源返回的候选统一重排并截取最终外部证据数量。"""
+        if not external_documents:
+            return []
+        return self.retriever_service.rerank_service.rerank_external_papers(
+            query=user_message,
+            candidates=external_documents,
+            top_k=config.DEFAULT_EXTERNAL_FINAL_LIMIT,
+        )
 
     def _select_final_evidence(
         self,

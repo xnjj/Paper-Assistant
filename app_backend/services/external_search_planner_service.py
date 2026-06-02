@@ -20,11 +20,11 @@ DEFAULT_EXTERNAL_FINAL_LIMIT = config.DEFAULT_EXTERNAL_FINAL_LIMIT
 class ExternalSearchQueryPlan:
     """描述一次外部检索中的单条简单 query。"""
 
-    query: str
+    query: list[str]
     limit: int = MAX_EXTERNAL_QUERY_LIMIT
-    year_from: int | None = None
-    sort_by: str = "relevance"
-    sort_order: str = "descending"
+    date_from: str | None = None
+    sortby: str = "relevance"
+    orderby: str = "descending"
     sources: list[str] | None = None
 
     def to_search_kwargs(self) -> dict[str, Any]:
@@ -32,10 +32,10 @@ class ExternalSearchQueryPlan:
         return {
             "query": self.query,
             "limit": self.limit,
-            "year_from": self.year_from,
-            "sort_by": self.sort_by,
-            "sort_order": self.sort_order,
-            "sources": self.sources or ["arxiv"],
+            "date_from": self.date_from,
+            "sortby": self.sortby,
+            "orderby": self.orderby,
+            "sources": self.sources or ["arxiv", "openalex"],
         }
 
 
@@ -123,12 +123,14 @@ class ExternalSearchPlannerService:
             "你是外部学术检索代理。"
             "当用户请求论文检索或研究现状时，必须调用 search_external_papers 工具生成检索计划。"
             f"当前年份是 {current_year}。"
-            "对于“最近3年”这类时间条件，请换算 year_from。"
-            f"请把复杂主题拆成最多 {MAX_PARALLEL_EXTERNAL_QUERIES} 条简单 arXiv query。"
+            "对于“最近3年”这类时间条件，请换算 date_from，格式必须是 yyyymmdd。"
+            f"请把复杂主题拆成最多 {MAX_PARALLEL_EXTERNAL_QUERIES} 组关键词。"
             f"每条 query 的 limit 不超过 {MAX_EXTERNAL_QUERY_LIMIT}。"
-            "少用 OR，避免复杂括号嵌套；每条 query 最多使用 2 个逻辑运算符。"
-            "query 字段优先使用英文关键词和 arXiv 布尔表达式，"
-            "例如 all:\"DQN\" AND all:\"autonomous driving\"。"
+            "sources 字段默认同时使用 arxiv 和 openalex。"
+            "arxiv 适合预印本和最新论文，openalex 适合按相关性做宽覆盖检索。"
+            "query 字段只能输出英文关键词或短语数组，最多 4 个元素。"
+            "不要输出 all:、AND、OR、cat:、search_query 等任何数据源专属语法。"
+            "例如 [\"DQN\", \"autonomous driving\"]。"
         )
 
     def _build_function_tools(self, *, default_limit: int) -> list[dict[str, Any]]:
@@ -138,7 +140,7 @@ class ExternalSearchPlannerService:
                 "type": "function",
                 "name": "search_external_papers",
                 "description": (
-                    "生成外部论文检索计划。请把复杂需求拆成多条简单 arXiv query，"
+                    "生成外部论文检索计划。请把复杂需求拆成多组关键词，"
                     f"最多 {MAX_PARALLEL_EXTERNAL_QUERIES} 条，每条 limit 不超过 {MAX_EXTERNAL_QUERY_LIMIT}。"
                 ),
                 "parameters": {
@@ -153,21 +155,26 @@ class ExternalSearchPlannerService:
                                 "type": "object",
                                 "properties": {
                                     "query": {
-                                        "type": "string",
+                                        "type": "array",
+                                        "items": {"type": "string"},
+                                        "minItems": 1,
+                                        "maxItems": 4,
                                         "description": (
-                                            "arXiv 检索表达式。优先使用英文关键词和 all:\"...\" 前缀，"
-                                            "例如 all:\"edge computing\" AND all:\"LLM\"。"
-                                            "可使用 ti:, abs:, au:, cat:, all: 等前缀。"
-                                            "推荐优先 AND，谨慎使用 OR，避免复杂括号嵌套。"
+                                            "检索关键词或短语数组，最多 4 个。"
+                                            "不要包含 all:、AND、OR、cat: 等数据源语法。"
+                                            "例如 [\"edge computing\", \"LLM inference\"]。"
                                         ),
                                     },
-                                    "year_from": {"type": "integer", "description": "起始年份，例如 2024。"},
-                                    "sort_by": {
+                                    "date_from": {
+                                        "type": "string",
+                                        "description": "日期下限，格式 yyyymmdd，例如 20240101。",
+                                    },
+                                    "sortby": {
                                         "type": "string",
                                         "enum": ["relevance", "submittedDate"],
                                         "description": "排序字段。",
                                     },
-                                    "sort_order": {
+                                    "orderby": {
                                         "type": "string",
                                         "enum": ["descending", "ascending"],
                                         "description": "排序方向。",
@@ -175,7 +182,7 @@ class ExternalSearchPlannerService:
                                     "sources": {
                                         "type": "array",
                                         "items": {"type": "string"},
-                                        "description": "检索源列表，目前优先使用 arxiv。",
+                                        "description": "检索源列表，可使用 arxiv、openalex；默认两者都使用。",
                                     },
                                     "limit": {
                                         "type": "integer",
@@ -231,14 +238,14 @@ class ExternalSearchPlannerService:
         common_fields = {
             key: value
             for key, value in arguments.items()
-            if key in {"year_from", "sort_by", "sort_order", "sources", "limit"}
+            if key in {"date_from", "sortby", "orderby", "sources", "limit"}
         }
         query_plans: list[ExternalSearchQueryPlan] = []
         seen_query_keys: set[str] = set()
 
         for item in query_items:
             if isinstance(item, str):
-                candidate = {**common_fields, "query": item}
+                candidate = {**common_fields, "query": [item]}
             elif isinstance(item, dict):
                 candidate = {**common_fields, **item}
             else:
@@ -252,7 +259,7 @@ class ExternalSearchPlannerService:
             if query_plan is None:
                 continue
 
-            query_key = self._normalize_for_key(query_plan.query)
+            query_key = self._normalize_for_key(" ".join(query_plan.query))
             if query_key in seen_query_keys:
                 continue
             seen_query_keys.add(query_key)
@@ -283,29 +290,29 @@ class ExternalSearchPlannerService:
         default_limit: int,
     ) -> ExternalSearchQueryPlan | None:
         """把单条 query 参数规范化为安全的检索子计划。"""
-        query = self._normalize_query_text(str(arguments.get("query") or "").strip())
+        query = self._normalize_query_keywords(arguments.get("query"))
         if not query:
-            query = fallback_query.query if fallback_query is not None else ""
+            query = fallback_query.query if fallback_query is not None else []
         if not query:
             return None
 
-        year_from = self._normalize_year(
-            arguments.get("year_from"),
-            fallback_query.year_from if fallback_query is not None else None,
+        date_from = self._normalize_date_from(
+            arguments.get("date_from"),
+            fallback_query.date_from if fallback_query is not None else None,
         )
 
-        sort_by = str(arguments.get("sort_by") or (fallback_query.sort_by if fallback_query else "relevance")).strip()
-        if sort_by not in {"relevance", "submittedDate"}:
-            sort_by = fallback_query.sort_by if fallback_query else "relevance"
+        sortby = str(arguments.get("sortby") or (fallback_query.sortby if fallback_query else "relevance")).strip()
+        if sortby not in {"relevance", "submittedDate"}:
+            sortby = fallback_query.sortby if fallback_query else "relevance"
 
-        sort_order = str(arguments.get("sort_order") or (fallback_query.sort_order if fallback_query else "descending")).strip()
-        if sort_order not in {"descending", "ascending"}:
-            sort_order = fallback_query.sort_order if fallback_query else "descending"
+        orderby = str(arguments.get("orderby") or (fallback_query.orderby if fallback_query else "descending")).strip()
+        if orderby not in {"descending", "ascending"}:
+            orderby = fallback_query.orderby if fallback_query else "descending"
 
         sources = arguments.get("sources")
         if not isinstance(sources, list) or not sources:
-            sources = fallback_query.sources if fallback_query is not None else ["arxiv"]
-        sources = [str(item).strip() for item in sources if str(item).strip()] or ["arxiv"]
+            sources = fallback_query.sources if fallback_query is not None else ["arxiv", "openalex"]
+        sources = self._normalize_sources(sources)
 
         return ExternalSearchQueryPlan(
             query=query,
@@ -314,9 +321,9 @@ class ExternalSearchPlannerService:
                 default=min(default_limit, MAX_EXTERNAL_QUERY_LIMIT),
                 max_limit=MAX_EXTERNAL_QUERY_LIMIT,
             ),
-            year_from=year_from,
-            sort_by=sort_by,
-            sort_order=sort_order,
+            date_from=date_from,
+            sortby=sortby,
+            orderby=orderby,
             sources=sources,
         )
 
@@ -330,16 +337,16 @@ class ExternalSearchPlannerService:
         """模型规划不可用时的规则兜底计划。"""
         current_year = datetime.now().year
         query_plan = ExternalSearchQueryPlan(
-            query=self._normalize_query_text(user_message.strip()) or "all:*",
+            query=self._build_fallback_keywords(user_message),
             limit=self._normalize_limit(
                 default_limit,
                 default=MAX_EXTERNAL_QUERY_LIMIT,
                 max_limit=MAX_EXTERNAL_QUERY_LIMIT,
             ),
-            year_from=current_year - 2 if freshness_requested else None,
-            sort_by="submittedDate" if freshness_requested else "relevance",
-            sort_order="descending",
-            sources=["arxiv"],
+            date_from=f"{current_year - 2}0101" if freshness_requested else None,
+            sortby="submittedDate" if freshness_requested else "relevance",
+            orderby="descending",
+            sources=["arxiv", "openalex"],
         )
         return ExternalSearchPlan(
             queries=[query_plan],
@@ -353,9 +360,67 @@ class ExternalSearchPlannerService:
             planned_by_model=False,
         )
 
-    def _normalize_query_text(self, value: str) -> str:
-        """清理模型可能生成的智能引号，避免 arXiv query 因符号异常而失效。"""
-        return (
+    def _normalize_query_keywords(self, value: Any) -> list[str]:
+        """规范化模型返回的关键词数组，兼容旧字符串输出并限制最多 4 个关键词。"""
+        if isinstance(value, list):
+            raw_keywords = value
+        else:
+            raw_text = self._normalize_text(str(value or ""))
+            raw_text = raw_text.replace("all:", "").replace("ti:", "").replace("abs:", "").replace("au:", "")
+            raw_text = re.sub(r"\b(?:AND|OR|NOT)\b", "|", raw_text, flags=re.IGNORECASE)
+            raw_text = raw_text.replace("(", " ").replace(")", " ").replace('"', " ")
+            raw_keywords = [item for item in re.split(r"[|,;，；、]", raw_text) if item.strip()]
+
+        keywords: list[str] = []
+        for item in raw_keywords:
+            keyword = self._normalize_text(str(item))
+            if keyword and keyword not in keywords:
+                keywords.append(keyword)
+            if len(keywords) >= 4:
+                break
+        return keywords
+
+    def _build_fallback_keywords(self, user_message: str) -> list[str]:
+        """模型规划不可用时，从用户问题中构造保守关键词。"""
+        normalized = self._normalize_text(user_message)
+        if not normalized:
+            return ["paper"]
+
+        quoted_phrases = re.findall(r"[“\"]([^”\"]{2,80})[”\"]", normalized)
+        keywords: list[str] = []
+        for phrase in quoted_phrases:
+            cleaned = self._normalize_text(phrase)
+            if cleaned and cleaned not in keywords:
+                keywords.append(cleaned)
+
+        ascii_terms = re.findall(r"[A-Za-z][A-Za-z0-9 -]{1,48}", normalized)
+        for term in ascii_terms:
+            cleaned = self._normalize_text(term)
+            if cleaned and cleaned.lower() not in {"and", "or", "the", "for"} and cleaned not in keywords:
+                keywords.append(cleaned)
+            if len(keywords) >= 4:
+                break
+
+        return keywords[:4] or [normalized[:80]]
+
+    def _normalize_date_from(self, value: Any, fallback: str | None) -> str | None:
+        """规范化 yyyymmdd 日期字段。"""
+        if isinstance(value, bool) or value is None:
+            return fallback
+        normalized = re.sub(r"[^0-9]", "", str(value))
+        if len(normalized) == 4:
+            normalized = f"{normalized}0101"
+        if len(normalized) != 8:
+            return fallback
+        try:
+            datetime.strptime(normalized, "%Y%m%d")
+        except ValueError:
+            return fallback
+        return normalized
+
+    def _normalize_text(self, value: str) -> str:
+        """清理模型可能生成的智能引号和多余空白。"""
+        normalized = (
             value.replace("“", '"')
             .replace("”", '"')
             .replace("„", '"')
@@ -366,19 +431,7 @@ class ExternalSearchPlannerService:
             .replace("`", "'")
             .strip()
         )
-
-    def _normalize_year(self, value: Any, fallback: int | None) -> int | None:
-        """规范化年份字段。"""
-        if isinstance(value, bool) or value is None:
-            return fallback
-        try:
-            year = int(value)
-        except (TypeError, ValueError):
-            return fallback
-        current_year = datetime.now().year
-        if year < 1991 or year > current_year + 1:
-            return fallback
-        return year
+        return re.sub(r"\s+", " ", normalized)
 
     def _normalize_limit(
         self,
@@ -400,6 +453,16 @@ class ExternalSearchPlannerService:
     def _normalize_for_key(self, value: str) -> str:
         """把 query 规整为适合去重比较的 key。"""
         return re.sub(r"\s+", " ", value.strip().lower())
+
+    def _normalize_sources(self, values: list[Any]) -> list[str]:
+        """规范化模型返回的数据源列表，只保留当前已支持的数据源。"""
+        supported_sources = {"arxiv", "openalex"}
+        sources: list[str] = []
+        for item in values:
+            source = str(item).strip().lower().replace("-", "_")
+            if source in supported_sources and source not in sources:
+                sources.append(source)
+        return sources or ["arxiv", "openalex"]
 
     def _get_model_name(self) -> str:
         """读取当前 LLM 名称。"""

@@ -370,6 +370,7 @@ Agent 操作记录：
             "query": str(step.get("query") or ""),
             "sort_by": str(step.get("sort_by") or "relevance"),
             "sort_order": str(step.get("sort_order") or "descending"),
+            "request_url": str(step.get("request_url") or ""),
             "result_count": step.get("result_count"),
             "error": str(step.get("error") or ""),
         }

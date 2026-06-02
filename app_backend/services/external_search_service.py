@@ -46,12 +46,12 @@ class ExternalSearchService(Protocol):
 
     def search_papers(
         self,
-        query: str,
+        query: list[str],
         *,
         limit: int = config.MAX_EXTERNAL_QUERY_LIMIT,
-        year_from: int | None = None,
-        sort_by: str = "relevance",
-        sort_order: str = "descending",
+        date_from: str | None = None,
+        sortby: str = "relevance",
+        orderby: str = "descending",
         sources: list[str] | None = None,
     ) -> list[ExternalPaperCandidate]:
         """根据查询词搜索外部论文候选。"""
@@ -89,12 +89,12 @@ class NullExternalSearchService:
 
     def search_papers(
         self,
-        query: str,
+        query: list[str],
         *,
         limit: int = config.MAX_EXTERNAL_QUERY_LIMIT,
-        year_from: int | None = None,
-        sort_by: str = "relevance",
-        sort_order: str = "descending",
+        date_from: str | None = None,
+        sortby: str = "relevance",
+        orderby: str = "descending",
         sources: list[str] | None = None,
     ) -> list[ExternalPaperCandidate]:
         """默认不返回任何外部候选。"""

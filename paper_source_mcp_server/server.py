@@ -43,11 +43,11 @@ def build_fastmcp_server(
         description="根据查询词搜索外部论文候选列表。",
     )
     def search_external_papers(
-        query: str,
+        query: list[str],
         limit: int = 10,
-        year_from: int | None = None,
-        sort_by: str = "relevance",
-        sort_order: str = "descending",
+        date_from: str | None = None,
+        sortby: str = "relevance",
+        orderby: str = "descending",
         sources: list[str] | None = None,
     ) -> dict[str, Any]:
         """暴露统一的外部论文搜索工具。"""
@@ -56,10 +56,10 @@ def build_fastmcp_server(
             {
                 "query": query,
                 "limit": limit,
-                "year_from": year_from,
-                "sort_by": sort_by,
-                "sort_order": sort_order,
-                "sources": sources or ["arxiv"],
+                "date_from": date_from,
+                "sortby": sortby,
+                "orderby": orderby,
+                "sources": sources or ["arxiv", "openalex"],
             },
         )
 

@@ -12,12 +12,12 @@ class ExternalPaperProvider(Protocol):
 
     def search(
         self,
-        query: str,
+        query: list[str],
         *,
         limit: int = 10,
-        year_from: int | None = None,
-        sort_by: str = "relevance",
-        sort_order: str = "descending",
+        date_from: str | None = None,
+        sortby: str = "relevance",
+        orderby: str = "descending",
     ) -> list[ExternalPaperRecord]:
         """根据查询词搜索外部论文候选。"""
         ...

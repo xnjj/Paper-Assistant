@@ -71,6 +71,39 @@ class RerankService:
                 break
         return selected
 
+    def rerank_external_papers(
+        self,
+        *,
+        query: str,
+        candidates: list[dict[str, Any]],
+        top_k: int,
+    ) -> list[dict[str, Any]]:
+        """对外部 paper 级候选做统一重排，避免直接混用不同数据源的相关性分数。"""
+        query_features = self._build_query_features(query)
+        scored_candidates: list[dict[str, Any]] = []
+
+        for recall_rank, candidate in enumerate(candidates):
+            prepared_candidate = dict(candidate)
+            prepared_candidate["chunk_text"] = prepared_candidate.get("chunk_text") or prepared_candidate.get("abstract") or ""
+            prepared_candidate["source_relevance_score"] = prepared_candidate.get("rerank_score")
+            score = self._score_candidate(
+                query_features=query_features,
+                candidate=prepared_candidate,
+                recall_rank=recall_rank,
+            )
+            prepared_candidate["recall_rank"] = recall_rank
+            prepared_candidate["rerank_score"] = round(score, 4)
+            scored_candidates.append(prepared_candidate)
+
+        scored_candidates.sort(
+            key=lambda item: (
+                item["rerank_score"],
+                -int(item.get("recall_rank") or 0),
+            ),
+            reverse=True,
+        )
+        return scored_candidates[:top_k]
+
     def _score_candidate(
         self,
         *,

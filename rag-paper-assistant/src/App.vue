@@ -120,6 +120,7 @@ interface MessagePreparationStep {
   query: string
   sortBy: string
   sortOrder: string
+  requestUrl: string
   resultCount?: number
   error?: string
 }
@@ -139,6 +140,7 @@ interface PersistedPreparationStep {
   query?: string
   sort_by?: string
   sort_order?: string
+  request_url?: string
   result_count?: number
   error?: string
 }
@@ -305,6 +307,7 @@ interface StreamPrepareStepPayload {
   query: string
   sort_by: string
   sort_order: string
+  request_url?: string
   result_count?: number
   error?: string
 }
@@ -1684,6 +1687,7 @@ function mapPreparationStep(step: StreamPrepareStepPayload): MessagePreparationS
     query: step.query || '',
     sortBy: step.sort_by || 'relevance',
     sortOrder: step.sort_order || 'descending',
+    requestUrl: step.request_url || '',
     resultCount: step.result_count,
     error: step.error || '',
   }
@@ -1720,6 +1724,7 @@ function mapPersistedPreparationStep(step: PersistedPreparationStep): MessagePre
     query: step.query || '',
     sortBy: step.sort_by || 'relevance',
     sortOrder: step.sort_order || 'descending',
+    requestUrl: step.request_url || '',
     resultCount: step.result_count,
     error: step.error || '',
   }
@@ -1778,12 +1783,16 @@ function formatPreparationStep(step: MessagePreparationStep) {
 
   const sortText = `${step.sortBy}${step.sortOrder ? `/${step.sortOrder}` : ''}`
   if (step.status === 'success') {
-    return `${step.source}检索到${step.resultCount ?? 0}篇文献：${step.query || '未命名查询'}和${step.sortBy || 'relevance'}`
+    return `${step.source}检索到${step.resultCount ?? 0}篇文献：${step.requestUrl || '暂无请求链接'}`
   }
   if (step.status === 'error') {
     return `${step.source} 检索失败：${step.error || '未知错误'}`
   }
   return `正在检索 ${step.source}：${step.query || '未命名查询'}；排序方式：${sortText}`
+}
+
+function hasPreparationRequestUrl(step: MessagePreparationStep) {
+  return step.source !== 'library' && step.status === 'success' && step.requestUrl.trim().length > 0
 }
 
 async function flushStreamFrame() {
@@ -2726,7 +2735,18 @@ function isReferenceExpanded(messageId: number, referenceNumber: number) {
                     :class="`preparation-step--${step.status}`"
                   >
                     <span class="preparation-step__dot" />
-                    <span>{{ formatPreparationStep(step) }}</span>
+                    <span v-if="hasPreparationRequestUrl(step)" class="preparation-step__text">
+                      {{ step.source }}检索到{{ step.resultCount ?? 0 }}篇文献：
+                      <a
+                        class="preparation-step__link"
+                        :href="step.requestUrl"
+                        target="_blank"
+                        rel="noreferrer"
+                      >
+                        {{ step.requestUrl }}
+                      </a>
+                    </span>
+                    <span v-else class="preparation-step__text">{{ formatPreparationStep(step) }}</span>
                   </div>
                 </div>
               </div>
@@ -2783,14 +2803,21 @@ function isReferenceExpanded(messageId: number, referenceNumber: number) {
                           DOI: {{ reference.matchedDocument.doi }}
                         </p> -->
                         <p>{{ reference.matchedDocument.abstract }}</p>
-                        <span
-                          class="reference-card__path"
-                        >
-                          {{
-                            isExternalRetrievedDocument(reference.matchedDocument)
-                              ? (reference.matchedDocument.url || '暂无链接')
-                              : reference.matchedDocument.file_path
-                          }}
+                        <template v-if="isExternalRetrievedDocument(reference.matchedDocument)">
+                          <a
+                            v-if="reference.matchedDocument.url"
+                            class="reference-card__path reference-card__path-link"
+                            :href="reference.matchedDocument.url"
+                            target="_blank"
+                            rel="noreferrer"
+                            @click.stop
+                          >
+                            {{ reference.matchedDocument.url }}
+                          </a>
+                          <span v-else class="reference-card__path">暂无链接</span>
+                        </template>
+                        <span v-else class="reference-card__path">
+                          {{ reference.matchedDocument.file_path }}
                         </span>
                         <!--调试检索到的文献片段-->
                         <!-- <span class="reference-card__snippet">{{ reference.matchedDocument.chunk_text }}</span> -->
@@ -4169,6 +4196,22 @@ function isReferenceExpanded(messageId: number, referenceNumber: number) {
   line-height: 1.6;
 }
 
+.preparation-step__text {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.preparation-step__link {
+  color: #2563eb;
+  text-decoration: underline;
+  text-underline-offset: 0.16em;
+  word-break: break-all;
+}
+
+.preparation-step__link:hover {
+  color: #1d4ed8;
+}
+
 .preparation-step__dot {
   width: 0.42rem;
   height: 0.42rem;
@@ -4296,6 +4339,16 @@ function isReferenceExpanded(messageId: number, referenceNumber: number) {
   color: #64748b;
   font-size: 0.86rem;
   word-break: break-all;
+}
+
+.reference-card__path-link {
+  color: #2563eb;
+  text-decoration: underline;
+  text-underline-offset: 0.16em;
+}
+
+.reference-card__path-link:hover {
+  color: #1d4ed8;
 }
 
 .reference-card__snippet {

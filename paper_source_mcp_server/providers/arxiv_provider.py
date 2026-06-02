@@ -7,6 +7,7 @@ import urllib.request
 import xml.etree.ElementTree as ET
 import socket
 import threading
+from datetime import datetime
 
 from paper_source_mcp_server.providers.base import ExternalPaperProvider
 from paper_source_mcp_server.schemas import ExternalFulltextRecord, ExternalPaperRecord
@@ -23,23 +24,22 @@ class ArxivProvider(ExternalPaperProvider):
 
     def search(
         self,
-        query: str,
+        query: list[str],
         *,
         limit: int = 10,
-        year_from: int | None = None,
-        sort_by: str = "relevance",
-        sort_order: str = "descending",
+        date_from: str | None = None,
+        sortby: str = "relevance",
+        orderby: str = "descending",
     ) -> list[ExternalPaperRecord]:
-        """调用 arXiv 官方 API 搜索论文候选，并在本地补做年份过滤。"""
-        #search_query = self._build_search_query(query)
-        request_limit = self._resolve_request_limit(limit=limit, year_from=year_from)
-        # TODO： max_results=request_limit change for test, remove later
+        """调用 arXiv 官方 API 搜索论文候选，并在本地补做日期过滤。"""
+        search_query = self._build_search_query(query)
+        request_limit = self._resolve_request_limit(limit=limit, date_from=date_from)
         request_url = self._build_query_url(
-            search_query=query,
+            search_query=search_query,
             start=0,
             max_results=request_limit,
-            sort_by=sort_by,
-            sort_order=sort_order,
+            sort_by="submittedDate",
+            sort_order="descending",
         )
         root = self._fetch_feed(request_url)
         entries = root.findall(self._atom_tag("entry"))
@@ -48,7 +48,7 @@ class ArxivProvider(ExternalPaperProvider):
             for record in (self._entry_to_record(entry) for entry in entries)
             if record is not None
         ]
-        filtered_records = self._filter_records_by_year(records, year_from=year_from)
+        filtered_records = self._filter_records_by_date(records, date_from=date_from)
         return filtered_records[:limit]
 
     def get_detail(self, external_id: str) -> ExternalPaperRecord | None:
@@ -81,39 +81,76 @@ class ArxivProvider(ExternalPaperProvider):
             is_open_access=True,
         )
 
-    def _build_search_query(self, query: str) -> str:
-        """构造 arXiv API 使用的基础查询表达式。"""
-        normalized_query = query.strip()
-        if not normalized_query:
+    def _build_search_query(self, query: list[str]) -> str:
+        """把统一关键词列表转换为 arXiv 使用的 all:\"...\" AND 表达式。"""
+        keywords = self._normalize_keywords(query)
+        if not keywords:
             return "all:*"
-        return f"all:{normalized_query}"
+        return " AND ".join(f'all:"{keyword}"' for keyword in keywords)
 
-    def _resolve_request_limit(self, *, limit: int, year_from: int | None) -> int:
-        """根据是否需要年份过滤，决定向 arXiv 额外多取多少结果。"""
-        if year_from is None:
+    def _resolve_request_limit(self, *, limit: int, date_from: str | None) -> int:
+        """根据是否需要日期过滤，决定向 arXiv 额外多取多少结果。"""
+        if date_from is None:
             return limit
-        #return min(max(limit * 4, 10), 30)
-        return  min(limit * 4, 20) 
+        return min(limit * 4, 20)
 
-    def _filter_records_by_year(
+    def _filter_records_by_date(
         self,
         records: list[ExternalPaperRecord],
         *,
-        year_from: int | None,
+        date_from: str | None,
     ) -> list[ExternalPaperRecord]:
-        """按年份下限过滤结果，避免把复杂日期范围直接交给 arXiv 查询。"""
-        if year_from is None:
+        """按 yyyymmdd 日期下限过滤结果，避免把日期范围交给 arXiv 查询。"""
+        if date_from is None:
+            return records
+
+        threshold = self._parse_date_from(date_from)
+        if threshold is None:
             return records
 
         filtered_records: list[ExternalPaperRecord] = []
         for record in records:
-            try:
-                record_year = int(record.year)
-            except (TypeError, ValueError):
+            published_at = getattr(record, "published_at", "")
+            record_date = self._parse_record_date(str(published_at or ""))
+            if record_date is None:
                 continue
-            if record_year >= year_from:
+            if record_date >= threshold:
                 filtered_records.append(record)
         return filtered_records
+
+    def _normalize_keywords(self, query: list[str]) -> list[str]:
+        """清理统一关键词列表，最多保留 4 个关键词或短语。"""
+        keywords: list[str] = []
+        for item in query:
+            keyword = " ".join(str(item).replace('"', " ").split())
+            if keyword and keyword not in keywords:
+                keywords.append(keyword)
+            if len(keywords) >= 4:
+                break
+        return keywords
+
+    def _parse_date_from(self, value: str) -> datetime | None:
+        """把 yyyymmdd 日期下限解析为 datetime。"""
+        normalized = (value or "").strip()
+        if not normalized:
+            return None
+        try:
+            return datetime.strptime(normalized, "%Y%m%d")
+        except ValueError:
+            return None
+
+    def _parse_record_date(self, value: str) -> datetime | None:
+        """解析 arXiv published 字段中的日期部分。"""
+        normalized = (value or "").strip()
+        if not normalized:
+            return None
+        try:
+            return datetime.fromisoformat(normalized.replace("Z", "+00:00")).replace(tzinfo=None)
+        except ValueError:
+            try:
+                return datetime.strptime(normalized[:10], "%Y-%m-%d")
+            except ValueError:
+                return None
 
     def _build_query_url(
         self,
@@ -233,6 +270,7 @@ class ArxivProvider(ExternalPaperProvider):
             abstract=self._normalize_text(summary),
             pdf_url=pdf_url.replace("http://", "https://"),
             relevance_score=None,
+            published_at=published,
         )
 
     def _read_text(self, element: ET.Element, tag: str) -> str:

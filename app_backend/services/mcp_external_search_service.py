@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import os
 import re
+import urllib.parse
 from typing import Any, Protocol
 
 import config_data as config
@@ -43,24 +45,25 @@ class MCPExternalSearchService(ExternalSearchService):
 
     def search_papers(
         self,
-        query: str,
+        query: list[str],
         *,
         limit: int = config.MAX_EXTERNAL_QUERY_LIMIT,
-        year_from: int | None = None,
-        sort_by: str = "relevance",
-        sort_order: str = "descending",
+        date_from: str | None = None,
+        sortby: str = "relevance",
+        orderby: str = "descending",
         sources: list[str] | None = None,
     ) -> list[ExternalPaperCandidate]:
         """调用 MCP 检索工具获取外部论文候选。"""
         if self.tool_invoker is None:
             return []
 
+        normalized_query = self._normalize_query_keywords(query)
         arguments = {
-            "query": query,
-            "limit": limit,
-            "year_from": year_from,
-            "sort_by": sort_by,
-            "sort_order": sort_order,
+            "query": normalized_query,
+            "limit": self._normalize_limit(limit),
+            "date_from": self._normalize_date_from(date_from),
+            "sortby": sortby,
+            "orderby": orderby,
             "sources": sources or [self.default_source],
         }
         try:
@@ -73,8 +76,8 @@ class MCPExternalSearchService(ExternalSearchService):
             fallback_arguments = {
                 **arguments,
                 "limit": min(5, int(limit or config.MAX_EXTERNAL_QUERY_LIMIT)),
-                "year_from": None,
-                "sort_by": "relevance",
+                "date_from": None,
+                "sortby": "relevance",
             }
             try:
                 raw_result = self.tool_invoker.call_tool(self.search_tool_name, fallback_arguments)
@@ -84,7 +87,7 @@ class MCPExternalSearchService(ExternalSearchService):
 
         candidates = self._coerce_candidate_list(raw_result)
         for candidate in candidates:
-            candidate.matched_query = query
+            candidate.matched_query = self._format_query_text(normalized_query)
         return candidates
 
     def search_papers_batch(
@@ -97,9 +100,11 @@ class MCPExternalSearchService(ExternalSearchService):
         if self.tool_invoker is None or not query_plans:
             return []
 
-        safe_plans = query_plans[: config.MAX_PARALLEL_EXTERNAL_QUERIES]
+        safe_plans = self._expand_query_plans_by_source(query_plans)
+        if not safe_plans:
+            return []
         results_by_index: dict[int, list[ExternalPaperCandidate]] = {}
-        max_workers = min(config.MAX_PARALLEL_EXTERNAL_QUERIES, max(1, len(safe_plans)))
+        max_workers = min(len(safe_plans), max(1, config.MAX_PARALLEL_EXTERNAL_QUERIES * self._count_sources(safe_plans)))
 
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_to_plan = {
@@ -118,7 +123,7 @@ class MCPExternalSearchService(ExternalSearchService):
         for index in range(len(safe_plans)):
             ordered_candidates.extend(results_by_index.get(index, []))
 
-        return self._dedupe_candidates(ordered_candidates)[: max(1, min(final_limit, config.DEFAULT_EXTERNAL_FINAL_LIMIT))]
+        return self._dedupe_candidates(ordered_candidates)
 
     def iter_search_papers_batch(
         self,
@@ -136,9 +141,17 @@ class MCPExternalSearchService(ExternalSearchService):
             }
             return
 
-        safe_plans = query_plans[: config.MAX_PARALLEL_EXTERNAL_QUERIES]
+        safe_plans = self._expand_query_plans_by_source(query_plans)
+        if not safe_plans:
+            yield {
+                "type": "search_batch_done",
+                "candidates": [],
+                "raw_count": 0,
+                "deduped_count": 0,
+            }
+            return
         results_by_index: dict[int, list[ExternalPaperCandidate]] = {}
-        max_workers = min(config.MAX_PARALLEL_EXTERNAL_QUERIES, max(1, len(safe_plans)))
+        max_workers = min(len(safe_plans), max(1, config.MAX_PARALLEL_EXTERNAL_QUERIES * self._count_sources(safe_plans)))
 
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_to_plan = {}
@@ -176,11 +189,10 @@ class MCPExternalSearchService(ExternalSearchService):
         for index in range(len(safe_plans)):
             ordered_candidates.extend(results_by_index.get(index, []))
         deduped_candidates = self._dedupe_candidates(ordered_candidates)
-        limited_candidates = deduped_candidates[: max(1, min(final_limit, config.DEFAULT_EXTERNAL_FINAL_LIMIT))]
 
         yield {
             "type": "search_batch_done",
-            "candidates": limited_candidates,
+            "candidates": deduped_candidates,
             "raw_count": len(ordered_candidates),
             "deduped_count": len(deduped_candidates),
         }
@@ -355,30 +367,56 @@ class MCPExternalSearchService(ExternalSearchService):
         )
 
     def _dedupe_candidates(self, candidates: list[ExternalPaperCandidate]) -> list[ExternalPaperCandidate]:
-        """按来源 ID、URL、标题逐级去重外部候选。"""
+        """按 DOI、arXiv ID、URL、标题去重，并限制每个来源最多返回的结果数。"""
         deduped: list[ExternalPaperCandidate] = []
         seen_keys: set[str] = set()
+        source_counts: dict[str, int] = {}
         for candidate in candidates:
-            key = self._build_candidate_unique_key(candidate)
-            if not key or key in seen_keys:
+            source = (candidate.source or self.default_source).strip().lower() or self.default_source
+            if source_counts.get(source, 0) >= config.MAX_SOURCE_FINAL_LIMIT:
                 continue
-            seen_keys.add(key)
+            keys = self._build_candidate_unique_keys(candidate)
+            if not keys or any(key in seen_keys for key in keys):
+                continue
+            seen_keys.update(keys)
+            source_counts[source] = source_counts.get(source, 0) + 1
             deduped.append(candidate)
         return deduped
 
-    def _build_candidate_unique_key(self, candidate: ExternalPaperCandidate) -> str:
-        """构造外部候选论文的去重键。"""
-        source = (candidate.source or "").strip().lower()
-        external_id = (candidate.external_id or "").strip().lower()
-        if source and external_id:
-            return f"{source}:{external_id}"
+    def _build_candidate_unique_keys(self, candidate: ExternalPaperCandidate) -> list[str]:
+        """构造外部候选论文的一组跨来源去重键。"""
+        keys: list[str] = []
+        doi = self._normalize_for_key(candidate.doi)
+        if doi:
+            keys.append(f"doi:{doi.removeprefix('https://doi.org/').removeprefix('http://doi.org/')}")
+
+        arxiv_id = self._extract_arxiv_id(candidate)
+        if arxiv_id:
+            keys.append(f"arxiv:{arxiv_id}")
 
         url = (candidate.url or "").strip().lower()
         if url:
-            return f"url:{url.rstrip('/')}"
+            keys.append(f"url:{url.rstrip('/')}")
 
         title = self._normalize_for_key(candidate.title)
-        return f"title:{title}" if title else ""
+        if title:
+            keys.append(f"title:{title}")
+
+        source = (candidate.source or "").strip().lower()
+        external_id = (candidate.external_id or "").strip().lower()
+        if source and external_id:
+            keys.append(f"{source}:{external_id}")
+        return keys
+
+    def _extract_arxiv_id(self, candidate: ExternalPaperCandidate) -> str:
+        """从候选论文的来源 ID 或 URL 中提取 arXiv 编号。"""
+        source = (candidate.source or "").strip().lower()
+        external_id = (candidate.external_id or "").strip().lower()
+        if source == "arxiv" and external_id:
+            return external_id
+        text = f"{candidate.url} {candidate.pdf_url or ''}".lower()
+        match = re.search(r"arxiv\.org/(?:abs|pdf)/([0-9]{4}\.[0-9]{4,5}(?:v\d+)?)", text)
+        return match.group(1) if match else ""
 
     def _normalize_for_key(self, value: str) -> str:
         """把字符串规整为适合比较的 key。"""
@@ -401,7 +439,150 @@ class MCPExternalSearchService(ExternalSearchService):
         source_text = ", ".join(str(item).strip() for item in sources if str(item).strip())
         return {
             "source": source_text or self.default_source,
-            "query": str(query_plan.get("query") or ""),
-            "sort_by": str(query_plan.get("sort_by") or "relevance"),
-            "sort_order": str(query_plan.get("sort_order") or "descending"),
+            "query": self._format_query_text(self._normalize_query_keywords(query_plan.get("query"))),
+            "sort_by": str(query_plan.get("sortby") or query_plan.get("sort_by") or "relevance"),
+            "sort_order": str(query_plan.get("orderby") or query_plan.get("sort_order") or "descending"),
+            "request_url": self._build_request_url(query_plan),
         }
+
+    def _build_request_url(self, query_plan: dict[str, Any]) -> str:
+        """根据统一检索参数构造当前数据源实际会访问的请求链接。"""
+        sources = self._normalize_sources(query_plan.get("sources"))
+        source = sources[0] if sources else self.default_source
+        keywords = self._normalize_query_keywords(query_plan.get("query"))
+        limit = self._normalize_limit(query_plan.get("limit"))
+        date_from = self._normalize_date_from(query_plan.get("date_from") or query_plan.get("year_from"))
+
+        if source == "arxiv":
+            return self._build_arxiv_request_url(keywords=keywords, limit=limit, date_from=date_from)
+        if source == "openalex":
+            return self._build_openalex_request_url(keywords=keywords, limit=limit, date_from=date_from)
+        return ""
+
+    def _build_arxiv_request_url(self, *, keywords: list[str], limit: int, date_from: str | None) -> str:
+        """把统一关键词转换为 arXiv API 请求链接；日期仍由程序在返回后过滤。"""
+        clean_keywords = [" ".join(keyword.replace('"', " ").split()) for keyword in keywords if keyword.strip()]
+        search_query = " AND ".join(f'all:"{keyword}"' for keyword in clean_keywords) if clean_keywords else "all:*"
+        request_limit = limit if date_from is None else min(limit * 4, 20)
+        params = {
+            "search_query": search_query,
+            "start": "0",
+            "max_results": str(request_limit),
+            "sortBy": "submittedDate",
+            "sortOrder": "descending",
+        }
+        return f"http://export.arxiv.org/api/query?{urllib.parse.urlencode(params)}"
+
+    def _build_openalex_request_url(self, *, keywords: list[str], limit: int, date_from: str | None) -> str:
+        """把统一关键词转换为 OpenAlex Works API 请求链接。"""
+        search_text = " ".join(keyword for keyword in keywords if keyword.strip())
+        if not search_text:
+            return ""
+
+        params = {
+            "search": search_text,
+            "per-page": str(limit),
+            "sort": "relevance_score:desc",
+        }
+        normalized_date = self._format_openalex_date(date_from)
+        if normalized_date:
+            params["filter"] = f"from_publication_date:{normalized_date}"
+
+        mailto = os.getenv("OPENALEX_MAILTO", "").strip()
+        if mailto:
+            params["mailto"] = mailto
+        return f"https://api.openalex.org/works?{urllib.parse.urlencode(params)}"
+
+    def _expand_query_plans_by_source(self, query_plans: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """把批量 query 计划展开为 query × source 子任务，并限制每个来源的并发子任务数。"""
+        expanded_plans: list[dict[str, Any]] = []
+        source_counts: dict[str, int] = {}
+
+        for query_plan in query_plans:
+            sources = self._normalize_sources(query_plan.get("sources"))
+            for source in sources:
+                if source_counts.get(source, 0) >= config.MAX_PARALLEL_EXTERNAL_QUERIES:
+                    continue
+                source_counts[source] = source_counts.get(source, 0) + 1
+                expanded_plans.append(
+                    {
+                        **query_plan,
+                        "query": self._normalize_query_keywords(query_plan.get("query")),
+                        "limit": self._normalize_limit(query_plan.get("limit")),
+                        "date_from": self._normalize_date_from(query_plan.get("date_from") or query_plan.get("year_from")),
+                        "sortby": str(query_plan.get("sortby") or query_plan.get("sort_by") or "relevance"),
+                        "orderby": str(query_plan.get("orderby") or query_plan.get("sort_order") or "descending"),
+                        "sources": [source],
+                    }
+                )
+        return expanded_plans
+
+    def _normalize_sources(self, raw_sources: Any) -> list[str]:
+        """规范化 query 计划中的来源列表。"""
+        if isinstance(raw_sources, list) and raw_sources:
+            sources = raw_sources
+        else:
+            sources = [self.default_source]
+
+        normalized_sources: list[str] = []
+        for item in sources:
+            source = str(item).strip().lower().replace("-", "_")
+            if source and source not in normalized_sources:
+                normalized_sources.append(source)
+        return normalized_sources or [self.default_source]
+
+    def _normalize_limit(self, value: Any) -> int:
+        """规范化每个子任务的请求数量上限。"""
+        try:
+            limit = int(value)
+        except (TypeError, ValueError):
+            limit = config.MAX_EXTERNAL_QUERY_LIMIT
+        return max(1, min(limit, config.MAX_EXTERNAL_QUERY_LIMIT))
+
+    def _normalize_query_keywords(self, value: Any) -> list[str]:
+        """规范化统一检索关键词列表，最多保留 4 个关键词或短语。"""
+        if isinstance(value, list):
+            raw_keywords = value
+        else:
+            raw_text = str(value or "")
+            raw_text = raw_text.replace("all:", "").replace("ti:", "").replace("abs:", "").replace("au:", "")
+            raw_text = re.sub(r"\b(?:AND|OR|NOT)\b", "|", raw_text, flags=re.IGNORECASE)
+            raw_text = raw_text.replace("(", " ").replace(")", " ").replace('"', " ")
+            raw_keywords = [item for item in re.split(r"[|,;，；、]", raw_text) if item.strip()]
+
+        keywords: list[str] = []
+        for item in raw_keywords:
+            keyword = " ".join(str(item).split())
+            if keyword and keyword not in keywords:
+                keywords.append(keyword)
+            if len(keywords) >= 4:
+                break
+        return keywords or ["paper"]
+
+    def _normalize_date_from(self, value: Any) -> str | None:
+        """规范化 yyyymmdd 日期下限，并兼容旧年份字段。"""
+        if value is None:
+            return None
+        normalized = re.sub(r"[^0-9]", "", str(value))
+        if len(normalized) == 4:
+            normalized = f"{normalized}0101"
+        return normalized if len(normalized) == 8 else None
+
+    def _format_openalex_date(self, value: str | None) -> str:
+        """把 yyyymmdd 日期转换为 OpenAlex API 接收的 YYYY-MM-DD。"""
+        normalized = self._normalize_date_from(value)
+        if not normalized:
+            return ""
+        return f"{normalized[:4]}-{normalized[4:6]}-{normalized[6:8]}"
+
+    def _format_query_text(self, query: list[str]) -> str:
+        """把关键词列表格式化为准备区和调试日志可读文本。"""
+        return " + ".join(query)
+
+    def _count_sources(self, query_plans: list[dict[str, Any]]) -> int:
+        """统计当前展开任务中涉及的数据源数量。"""
+        sources = {
+            str((query_plan.get("sources") or [self.default_source])[0]).strip().lower()
+            for query_plan in query_plans
+        }
+        return max(1, len(sources))
