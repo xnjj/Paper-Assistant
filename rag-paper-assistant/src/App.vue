@@ -2614,32 +2614,32 @@ function isReferenceExpanded(messageId: number, referenceNumber: number) {
         </div>
       </header>
 
-      <div class="stage-layout">
-
-      <section v-if="isHomeView" class="hero-panel">
-        <div class="hero-copy">
-          <p class="hero-kicker">RAG Paper Assistant</p>
-          <h1>从本地文献库出发，进入真正可持续的论文助手工作流。</h1>
-          <!-- <p class="hero-description">
-            发送第一条消息后会自动创建会话并切换到聊天页。新建会话则会回到当前首页，你可以重新选择提示词或同步本地文献文件夹。
-          </p> -->
-        </div>
-
-        <div class="prompt-grid">
-          <button
-            v-for="prompt in quickPrompts"
-            :key="prompt.id"
-            class="prompt-card"
-            type="button"
-            @click="usePrompt(prompt)"
-          >
-            <strong>{{ prompt.title }}</strong>
-            <span>{{ prompt.summary }}</span>
-          </button>
-        </div>
-      </section>
+      <!-- <div class="stage-layout"> -->
 
       <section class="chat-card" :class="{ 'chat-card--session': !isHomeView, 'chat-card--home': isHomeView }">
+        <section v-if="isHomeView" class="hero-panel">
+          <div class="hero-copy">
+            <p class="hero-kicker">RAG Paper Assistant</p>
+            <h1>从本地文献库出发，构建高效研究工作流。</h1>
+            <!-- <p class="hero-description">
+              发送第一条消息后会自动创建会话并切换到聊天页。新建会话则会回到当前首页，你可以重新选择提示词或同步本地文献文件夹。
+            </p> -->
+          </div>
+
+          <div class="prompt-grid">
+            <button
+              v-for="prompt in quickPrompts"
+              :key="prompt.id"
+              class="prompt-card"
+              type="button"
+              @click="usePrompt(prompt)"
+            >
+              <strong>{{ prompt.title }}</strong>
+              <span>{{ prompt.summary }}</span>
+            </button>
+          </div>
+        </section>
+
         <!-- <div class="utility-bar">
           <div class="desktop-badge" :class="{ 'desktop-badge--inactive': !desktopMode }">
             {{ desktopMode ? '已连接 Electron 桌面环境' : '当前为浏览器模式，不能直接选择真实本地文件夹' }}
@@ -2885,7 +2885,7 @@ function isReferenceExpanded(messageId: number, referenceNumber: number) {
           </div>
         </div>
       </section>
-      </div>
+      <!-- </div> -->
     </main>
 
     <div v-if="renamingSessionId !== null" class="dialog-mask" @click.self="closeRenameDialog()">
@@ -3814,7 +3814,6 @@ function isReferenceExpanded(messageId: number, referenceNumber: number) {
   box-shadow: 0 0 0 6px rgba(37, 99, 235, 0.09);
 }
 
-.hero-panel,
 .chat-card {
   max-width: 1080px;
   margin: 1.25rem auto 0;
@@ -4554,7 +4553,6 @@ function isReferenceExpanded(messageId: number, referenceNumber: number) {
   overflow: hidden;
 }
 
-.stage-layout > .hero-panel,
 .stage-layout > .chat-card {
   width: 100%;
   max-width: none;
@@ -4568,15 +4566,16 @@ function isReferenceExpanded(messageId: number, referenceNumber: number) {
 
 .chat-stage--home .hero-panel {
   flex-shrink: 0;
-  padding: 2rem 2.15rem;
-  border-color: rgba(255, 255, 255, 0.74);
-  background: rgba(255, 255, 255, 0.52);
-  box-shadow: 0 18px 42px rgba(15, 23, 42, 0.05);
+  padding: 0;
+  border: none;
+  background: transparent;
+  box-shadow: none;
+  backdrop-filter: none;
 }
 
 .chat-stage--home .chat-card {
   flex-shrink: 0;
-  padding: 0.95rem 1rem 1rem;
+  padding: 1.25rem;
   border-color: rgba(255, 255, 255, 0.72);
   background: rgba(255, 255, 255, 0.48);
   box-shadow: 0 18px 42px rgba(15, 23, 42, 0.05);
@@ -4629,7 +4628,7 @@ function isReferenceExpanded(messageId: number, referenceNumber: number) {
 }
 
 .chat-stage--home .composer {
-  margin-top: 0.75rem;
+  margin-top: 1.15rem;
   padding: 0.82rem 0.85rem;
   border-radius: 20px;
   background: rgba(255, 255, 255, 0.8);
@@ -5028,7 +5027,7 @@ function isReferenceExpanded(messageId: number, referenceNumber: number) {
     grid-template-columns: 1fr;
   }
 
-  .hero-panel {
+  .chat-stage:not(.chat-stage--home) .hero-panel {
     padding: 2rem 1.35rem;
   }
 
