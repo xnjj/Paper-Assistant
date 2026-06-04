@@ -272,6 +272,18 @@ class MCPExternalSearchService(ExternalSearchService):
         pdf_url = str(payload.get("pdf_url") or "").strip() or None
         source = str(payload.get("source") or self.default_source).strip() or self.default_source
         relevance_score = self._coerce_score(payload.get("relevance_score"))
+        publisher = str(payload.get("publisher") or "").strip()
+        publisher_place = str(payload.get("publisher_place") or payload.get("place") or "").strip()
+        volume = str(payload.get("volume") or "").strip()
+        issue = str(payload.get("issue") or "").strip()
+        pages = str(payload.get("pages") or payload.get("page") or "").strip()
+        article_number = str(payload.get("article_number") or payload.get("article-number") or "").strip()
+        degree_institution = str(payload.get("degree_institution") or "").strip()
+        degree_location = str(payload.get("degree_location") or "").strip()
+        proceedings_title = str(payload.get("proceedings_title") or payload.get("proceedings") or "").strip()
+        conference_name = str(payload.get("conference_name") or payload.get("conference") or "").strip()
+        publication_date = str(payload.get("publication_date") or payload.get("published_at") or "").strip()
+        document_type = str(payload.get("document_type") or payload.get("type") or "").strip()
 
         return ExternalPaperCandidate(
             source=source,
@@ -291,9 +303,34 @@ class MCPExternalSearchService(ExternalSearchService):
                 doi=doi,
                 url=url,
                 source=source,
+                publisher=publisher,
+                publisher_place=publisher_place,
+                volume=volume,
+                issue=issue,
+                pages=pages,
+                article_number=article_number,
+                degree_institution=degree_institution,
+                degree_location=degree_location,
+                proceedings_title=proceedings_title,
+                conference_name=conference_name,
+                publication_date=publication_date,
+                document_type=document_type,
             ),
             pdf_url=pdf_url,
             relevance_score=relevance_score,
+            publisher=publisher,
+            publisher_place=publisher_place,
+            volume=volume,
+            issue=issue,
+            pages=pages,
+            article_number=article_number,
+            degree_institution=degree_institution,
+            degree_location=degree_location,
+            proceedings_title=proceedings_title,
+            conference_name=conference_name,
+            publication_date=publication_date,
+            document_type=document_type,
+            metadata_sources=[source],
         )
 
     def _coerce_fulltext_payload(
@@ -354,6 +391,18 @@ class MCPExternalSearchService(ExternalSearchService):
         doi: str,
         url: str,
         source: str,
+        publisher: str = "",
+        publisher_place: str = "",
+        volume: str = "",
+        issue: str = "",
+        pages: str = "",
+        article_number: str = "",
+        degree_institution: str = "",
+        degree_location: str = "",
+        proceedings_title: str = "",
+        conference_name: str = "",
+        publication_date: str = "",
+        document_type: str = "",
     ) -> str:
         """为外部候选生成近似 GB/T 7714-2015 的默认引用文本。"""
         return format_gbt7714_citation(
@@ -364,6 +413,18 @@ class MCPExternalSearchService(ExternalSearchService):
             doi=doi,
             url=url,
             source_type=source or "external",
+            document_type=document_type,
+            publisher=publisher,
+            publisher_place=publisher_place,
+            volume=volume,
+            issue=issue,
+            pages=pages,
+            publication_date=publication_date,
+            article_number=article_number,
+            degree_institution=degree_institution,
+            degree_location=degree_location,
+            proceedings_title=proceedings_title,
+            conference_name=conference_name,
         )
 
     def _dedupe_candidates(self, candidates: list[ExternalPaperCandidate]) -> list[ExternalPaperCandidate]:

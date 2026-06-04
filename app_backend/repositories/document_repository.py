@@ -56,19 +56,36 @@ class DocumentRepository:
         source_uri: str,
         content_text: str,
         status: str,
+        publication_date: str = "",
+        document_type: str = "",
+        publisher: str = "",
+        publisher_place: str = "",
+        volume: str = "",
+        issue: str = "",
+        pages: str = "",
+        article_number: str = "",
+        degree_institution: str = "",
+        degree_location: str = "",
+        proceedings_title: str = "",
+        conference_name: str = "",
+        extra_metadata: dict[str, str] | None = None,
     ) -> int:
         """Insert one document into a target library."""
         now = datetime.now().isoformat(timespec="seconds")
+        extra_metadata_json = json.dumps(extra_metadata or {}, ensure_ascii=False)
         with self.db_manager.get_connection() as connection:
             cursor = connection.execute(
                 """
                 INSERT INTO documents(
                     library_id, file_hash, file_path, file_name, title, abstract,
                     authors_json, keywords_json, year, doi, url, venue,
-                    citation_text_default, source_type, source_uri, content_text,
+                    citation_text_default, publication_date, document_type, publisher,
+                    publisher_place, volume, issue, pages, article_number,
+                    degree_institution, degree_location, proceedings_title,
+                    conference_name, extra_metadata_json, source_type, source_uri, content_text,
                     status, created_at, updated_at
                 )
-                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     library_id,
@@ -84,6 +101,19 @@ class DocumentRepository:
                     url,
                     venue,
                     citation_text_default,
+                    publication_date,
+                    document_type,
+                    publisher,
+                    publisher_place,
+                    volume,
+                    issue,
+                    pages,
+                    article_number,
+                    degree_institution,
+                    degree_location,
+                    proceedings_title,
+                    conference_name,
+                    extra_metadata_json,
                     source_type,
                     source_uri,
                     content_text,

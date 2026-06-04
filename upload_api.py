@@ -34,9 +34,9 @@ class CreateLibraryRequest(BaseModel):
     name: str
     description: str = ""
     folder_path: str = ""
-    embedding_model: str = config.EMBEDDING_MODEL_NAME
-    embedding_max_input_tokens: int = 2048
-    chunk_mode: str = "recursive"
+    embedding_model: str
+    embedding_max_input_tokens: int
+    chunk_mode: str
 
 
 class UpdateLibraryRequest(BaseModel):
@@ -74,10 +74,8 @@ class CreateMemoryRequest(BaseModel):
 
 class GlobalModelConfigPayload(BaseModel):
     llm_model: str
-    embedding_model: str
     api_key: str
     llm_context_length: int
-    embedding_max_input_tokens: int
 
 
 class LibraryModelConfigPayload(BaseModel):
@@ -169,6 +167,10 @@ def create_library(payload: CreateLibraryRequest) -> dict[str, object]:
             embedding_model=payload.embedding_model,
             embedding_max_input_tokens=payload.embedding_max_input_tokens,
             chunk_mode=payload.chunk_mode,
+        )
+        container.config_service.update_default_library_index_config(
+            embedding_model=payload.embedding_model,
+            embedding_max_input_tokens=payload.embedding_max_input_tokens,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc

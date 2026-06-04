@@ -7,13 +7,13 @@ from typing import Any
 
 from langchain_community.chat_models import ChatTongyi
 
-import config_data as config
 from app_backend.models import MemoryRecord, MessageRecord, SessionRecord
 from app_backend.repositories.library_repository import LibraryRepository
 from app_backend.repositories.session_repository import SessionRepository
 from app_backend.services.agent_orchestrator_service import AgentOrchestratorService
 from app_backend.services.citation_formatter import format_gbt7714_citation
 from app_backend.services.config_service import ConfigService
+from app_backend.services.crossref_metadata_enrichment_service import CrossrefMetadataEnrichmentService
 from app_backend.services.memory_service import MemoryService
 from app_backend.services.retriever_service import RetrieverService
 
@@ -35,6 +35,7 @@ class ChatService:
         retriever_service: RetrieverService,
         config_service: ConfigService | None = None,
         agent_orchestrator_service: AgentOrchestratorService | None = None,
+        crossref_metadata_enrichment_service: CrossrefMetadataEnrichmentService | None = None,
     ) -> None:
         """初始化聊天服务并注入所需仓储和检索能力。"""
         self.session_repository = session_repository
@@ -43,6 +44,7 @@ class ChatService:
         self.retriever_service = retriever_service
         self.config_service = config_service
         self.agent_orchestrator_service = agent_orchestrator_service
+        self.crossref_metadata_enrichment_service = crossref_metadata_enrichment_service
 
     def _to_json_safe(self, value: Any) -> Any:
         """把对象转换为可 JSON 序列化的结构。"""
@@ -446,9 +448,29 @@ Agent 操作记录：
         if not ordered_bindings:
             return normalized_body, []
 
+        ordered_bindings = self._enrich_final_citations(ordered_bindings)
         reference_section = self._build_reference_section(ordered_bindings)
         final_answer = f"{normalized_body}\n\n参考文献\n{reference_section}".strip()
         return final_answer, ordered_bindings
+
+    def _enrich_final_citations(self, citations: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """仅对模型最终实际引用的文献进行 Crossref 临时补全，不写入本地数据库。"""
+        if not citations or self.crossref_metadata_enrichment_service is None:
+            return citations
+
+        enriched_documents = self.crossref_metadata_enrichment_service.enrich_documents(
+            citations,
+            include_local=True,
+        )
+        enriched_citations: list[dict[str, Any]] = []
+        for original, enriched in zip(citations, enriched_documents):
+            merged = {**original, **enriched}
+            citation_text = self._format_citation_text(merged)
+            if citation_text:
+                merged["text"] = citation_text
+                merged["citation_text_default"] = citation_text
+            enriched_citations.append(merged)
+        return enriched_citations
 
     def _build_citation_binding(
         self,
@@ -458,10 +480,14 @@ Agent 操作记录：
         document: dict[str, Any],
     ) -> dict[str, Any]:
         """构造一条前端可直接使用的引用绑定记录。"""
-        citation_text = self._format_citation_text(document)
+        source_type = str(document.get("source_type") or "")
+        if not source_type:
+            source_type = "external" if source_id.startswith("ext_") else "local"
+        citation_text = self._format_citation_text({**document, "source_id": source_id, "source_type": source_type})
         return {
             "number": number,
             "source_id": source_id,
+            "source_type": source_type,
             "document_id": document.get("document_id"),
             "text": citation_text,
             "title": document.get("title") or "",
@@ -473,6 +499,18 @@ Agent 操作记录：
             "doi": document.get("doi") or "",
             "url": document.get("url") or "",
             "citation_text_default": citation_text,
+            "publisher": document.get("publisher") or "",
+            "publisher_place": document.get("publisher_place") or "",
+            "volume": document.get("volume") or "",
+            "issue": document.get("issue") or "",
+            "pages": document.get("pages") or "",
+            "article_number": document.get("article_number") or "",
+            "degree_institution": document.get("degree_institution") or "",
+            "degree_location": document.get("degree_location") or "",
+            "proceedings_title": document.get("proceedings_title") or "",
+            "conference_name": document.get("conference_name") or "",
+            "publication_date": document.get("publication_date") or "",
+            "document_type": document.get("document_type") or "",
             "chunk_index": document.get("chunk_index"),
             "chunk_text": document.get("chunk_text") or "",
         }
@@ -502,6 +540,19 @@ Agent 操作记录：
             doi=str(payload.get("doi") or ""),
             url=str(payload.get("url") or ""),
             source_type=source_type or "local",
+            document_type=str(payload.get("document_type") or ""),
+            publisher=str(payload.get("publisher") or ""),
+            publisher_place=str(payload.get("publisher_place") or ""),
+            volume=str(payload.get("volume") or ""),
+            issue=str(payload.get("issue") or ""),
+            pages=str(payload.get("pages") or payload.get("page") or ""),
+            publication_date=str(payload.get("publication_date") or ""),
+            article_number=str(payload.get("article_number") or ""),
+            degree_institution=str(payload.get("degree_institution") or ""),
+            degree_location=str(payload.get("degree_location") or ""),
+            proceedings_title=str(payload.get("proceedings_title") or ""),
+            conference_name=str(payload.get("conference_name") or ""),
+            access_date=str(payload.get("access_date") or ""),
         )
         return citation_text or str(payload.get("citation_text_default") or payload.get("title") or "").strip()
 
@@ -523,11 +574,10 @@ Agent 操作记录：
 
     def _build_model(self, *, streaming: bool) -> ChatTongyi:
         """根据当前运行时配置创建聊天模型实例。"""
-        model_name = config.LLM_MODEL_NAME
-        api_key = config.OPENAI_API_KEY
-        if self.config_service is not None:
-            model_name = self.config_service.get_llm_model_name()
-            api_key = self.config_service.get_api_key()
+        if self.config_service is None:
+            raise ValueError("模型配置服务未初始化，请先完成模型配置。")
+        model_name = self.config_service.get_llm_model_name()
+        api_key = self.config_service.get_api_key()
 
         return ChatTongyi(
             model=model_name,

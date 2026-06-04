@@ -10,6 +10,7 @@ from app_backend.repositories.session_repository import SessionRepository
 from app_backend.repositories.sync_repository import SyncRepository
 from app_backend.services.chat_service import ChatService
 from app_backend.services.config_service import ConfigService
+from app_backend.services.crossref_metadata_enrichment_service import CrossrefMetadataEnrichmentService
 from app_backend.services.document_ingest_service import DocumentIngestService
 from app_backend.services.agent_orchestrator_service import AgentOrchestratorService
 from app_backend.services.external_search_planner_service import ExternalSearchPlannerService
@@ -72,6 +73,7 @@ class ServiceContainer:
         self.mcp_tool_invoker = StdioMCPToolInvoker()
         self.external_search_service = MCPExternalSearchService(self.mcp_tool_invoker)
         self.external_search_planner_service = ExternalSearchPlannerService(self.config_service)
+        self.crossref_metadata_enrichment_service = CrossrefMetadataEnrichmentService()
         self.agent_orchestrator_service = AgentOrchestratorService(
             session_repository=self.session_repository,
             library_repository=self.library_repository,
@@ -88,4 +90,5 @@ class ServiceContainer:
             retriever_service=self.retriever_service,
             config_service=self.config_service,
             agent_orchestrator_service=self.agent_orchestrator_service,
+            crossref_metadata_enrichment_service=self.crossref_metadata_enrichment_service,
         )

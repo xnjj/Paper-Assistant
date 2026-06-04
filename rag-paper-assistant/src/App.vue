@@ -17,6 +17,9 @@ interface LibrarySummary {
   description: string
   folder_path: string
   collection_name: string
+  embedding_model: string
+  embedding_max_input_tokens: number
+  chunk_mode: string
   document_count: number
   created_at: string
   updated_at: string
@@ -43,6 +46,19 @@ interface LibraryDocumentDetails {
   doi: string
   url: string
   venue: string
+  publication_date: string
+  document_type: string
+  publisher: string
+  publisher_place: string
+  volume: string
+  issue: string
+  pages: string
+  article_number: string
+  degree_institution: string
+  degree_location: string
+  proceedings_title: string
+  conference_name: string
+  extra_metadata: Record<string, string>
   citation_text_default: string
   source_type: string
   source_uri: string
@@ -67,6 +83,7 @@ interface SessionMessage {
 interface RetrievedDocument {
   document_id: number
   source_id?: string
+  source_type?: string
   title: string
   abstract: string
   file_path: string
@@ -76,6 +93,18 @@ interface RetrievedDocument {
   doi?: string
   url?: string
   citation_text_default?: string
+  publisher?: string
+  publisher_place?: string
+  volume?: string
+  issue?: string
+  pages?: string
+  article_number?: string
+  degree_institution?: string
+  degree_location?: string
+  proceedings_title?: string
+  conference_name?: string
+  publication_date?: string
+  document_type?: string
   chunk_index?: number
   chunk_text: string
 }
@@ -83,6 +112,7 @@ interface RetrievedDocument {
 interface CitationBinding {
   number: number
   source_id: string
+  source_type?: string
   document_id: number
   text: string
   title: string
@@ -94,6 +124,18 @@ interface CitationBinding {
   doi?: string
   url?: string
   citation_text_default?: string
+  publisher?: string
+  publisher_place?: string
+  volume?: string
+  issue?: string
+  pages?: string
+  article_number?: string
+  degree_institution?: string
+  degree_location?: string
+  proceedings_title?: string
+  conference_name?: string
+  publication_date?: string
+  document_type?: string
   chunk_index?: number
   chunk_text?: string
 }
@@ -191,6 +233,8 @@ interface FolderSyncResponse {
   skipped_count?: number
   failed_count?: number
   results?: SyncResultRecord[]
+  started_at?: string
+  finished_at?: string | null
 }
 
 interface SyncJobStatusResponse extends FolderSyncResponse {
@@ -251,8 +295,8 @@ interface GlobalModelConfigPayload {
   llm_model: string
   embedding_model: string
   api_key: string
-  llm_context_length: number
-  embedding_max_input_tokens: number
+  llm_context_length: number | null
+  embedding_max_input_tokens: number | null
 }
 
 interface LibraryModelConfigPayload {
@@ -368,6 +412,7 @@ const followMessageStreamToBottom = ref(false)
 
 const syncing = ref(false)
 const activeSyncJobId = ref<number | null>(null)
+const activeSyncLibraryName = ref('')
 const configuringFolder = ref(false)
 const configuredFolderPath = ref('')
 const configuredFolderPdfCount = ref<number | null>(null)
@@ -416,7 +461,6 @@ const quickPrompts: PromptTemplateCard[] = [
   },
 ]
 
-const canSend = computed(() => inputValue.value.trim().length > 0 && !isSending.value)
 const desktopMode = computed(() => Boolean(window.electronAPI))
 const activeLibrary = computed(() => libraries.value.find((item) => item.id === activeLibraryId.value) ?? null)
 const activeLibraryName = computed(() => activeLibrary.value?.name ?? '')
@@ -430,11 +474,11 @@ const newLibraryDescription = ref('')
 const newLibraryFolderPath = ref('')
 const newLibraryIndexConfig = ref<{
   embeddingModel: string
-  embeddingMaxInputTokens: number
+  embeddingMaxInputTokens: number | null
   chunkMode: 'recursive' | 'semantic'
 }>({
-  embeddingModel: 'text-embedding-v1',
-  embeddingMaxInputTokens: 2048,
+  embeddingModel: '',
+  embeddingMaxInputTokens: null,
   chunkMode: 'recursive',
 })
 const newLibraryFieldErrors = ref({
@@ -470,12 +514,22 @@ const embeddingModelSuggestions = [
   'bge-m3',
 ]
 const globalModelConfig = ref({
-  llmModel: 'qwen3-max',
-  embeddingModel: 'text-embedding-v1',
+  llmModel: '',
+  embeddingModel: '',
   apiKey: '',
-  llmContextLength: 200000,
-  embeddingMaxInputTokens: 2048,
+  llmContextLength: null as number | null,
+  embeddingMaxInputTokens: null as number | null,
 })
+const isGlobalLlmConfigComplete = computed(() => {
+  const llmContextLength = Number(globalModelConfig.value.llmContextLength)
+  return (
+    globalModelConfig.value.llmModel.trim().length > 0 &&
+    globalModelConfig.value.apiKey.trim().length > 0 &&
+    Number.isFinite(llmContextLength) &&
+    llmContextLength > 0
+  )
+})
+const canSend = computed(() => inputValue.value.trim().length > 0 && !isSending.value && isGlobalLlmConfigComplete.value)
 const libraryModelConfig = ref<{
   chunkMode: 'recursive' | 'semantic'
 }>({
@@ -574,7 +628,7 @@ function validateModelConfigForm() {
 }
 
 function closeLibraryPanel() {
-  if (creatingLibrary.value || configuringFolder.value || syncing.value) {
+  if (configuringFolder.value) {
     return
   }
 
@@ -655,11 +709,11 @@ async function loadModelConfig(libraryId: number | null) {
 function resetModelConfigDraft() {
   clearModelConfigFieldErrors()
   globalModelConfig.value = {
-    llmModel: 'qwen3-max',
-    embeddingModel: 'text-embedding-v1',
+    llmModel: '',
+    embeddingModel: '',
     apiKey: '',
-    llmContextLength: 200000,
-    embeddingMaxInputTokens: 2048,
+    llmContextLength: null,
+    embeddingMaxInputTokens: null,
   }
   libraryModelConfig.value = {
     chunkMode: 'recursive',
@@ -681,10 +735,8 @@ async function saveModelConfig() {
       library_id: modelConfigLibraryId.value,
       global_config: {
         llm_model: globalModelConfig.value.llmModel,
-        embedding_model: globalModelConfig.value.embeddingModel,
         api_key: globalModelConfig.value.apiKey,
         llm_context_length: globalModelConfig.value.llmContextLength,
-        embedding_max_input_tokens: globalModelConfig.value.embeddingMaxInputTokens,
       },
       library_config:
         modelConfigLibraryId.value !== null
@@ -708,14 +760,30 @@ async function saveModelConfig() {
 function applyModelConfigPayload(payload: ModelConfigResponsePayload) {
   clearModelConfigFieldErrors()
   globalModelConfig.value = {
-    llmModel: payload.global.llm_model,
-    embeddingModel: payload.global.embedding_model,
-    apiKey: payload.global.api_key,
-    llmContextLength: payload.global.llm_context_length,
-    embeddingMaxInputTokens: payload.global.embedding_max_input_tokens,
+    llmModel: payload.global.llm_model || '',
+    embeddingModel: payload.global.embedding_model || '',
+    apiKey: payload.global.api_key || '',
+    llmContextLength: payload.global.llm_context_length ?? null,
+    embeddingMaxInputTokens: payload.global.embedding_max_input_tokens ?? null,
   }
   libraryModelConfig.value = {
     chunkMode: payload.library.chunk_mode,
+  }
+  applyDefaultNewLibraryIndexConfig(payload)
+}
+
+function applyDefaultNewLibraryIndexConfig(payload: ModelConfigResponsePayload) {
+  const hasNewLibraryDraft =
+    newLibraryName.value.trim().length > 0 ||
+    newLibraryFolderPath.value.trim().length > 0
+  if (hasNewLibraryDraft) {
+    return
+  }
+
+  newLibraryIndexConfig.value = {
+    embeddingModel: payload.global.embedding_model || '',
+    embeddingMaxInputTokens: payload.global.embedding_max_input_tokens ?? null,
+    chunkMode: newLibraryIndexConfig.value.chunkMode,
   }
 }
 
@@ -790,6 +858,9 @@ async function createLibraryWithFolder() {
   }
 
   const libraryName = newLibraryName.value.trim()
+  const usedEmbeddingModel = newLibraryIndexConfig.value.embeddingModel.trim()
+  const usedEmbeddingMaxInputTokens = Number(newLibraryIndexConfig.value.embeddingMaxInputTokens)
+  const usedChunkMode = newLibraryIndexConfig.value.chunkMode
 
   creatingLibrary.value = true
   clearFeedback()
@@ -800,9 +871,9 @@ async function createLibraryWithFolder() {
       body: JSON.stringify({
         name: libraryName,
         folder_path: newLibraryFolderPath.value || undefined,
-        embedding_model: newLibraryIndexConfig.value.embeddingModel.trim(),
-        embedding_max_input_tokens: Number(newLibraryIndexConfig.value.embeddingMaxInputTokens),
-        chunk_mode: newLibraryIndexConfig.value.chunkMode,
+        embedding_model: usedEmbeddingModel,
+        embedding_max_input_tokens: usedEmbeddingMaxInputTokens,
+        chunk_mode: usedChunkMode,
       }),
     })
 
@@ -814,9 +885,14 @@ async function createLibraryWithFolder() {
     newLibraryName.value = ''
     newLibraryFolderPath.value = ''
     newLibraryDescription.value = ''
+    globalModelConfig.value = {
+      ...globalModelConfig.value,
+      embeddingModel: usedEmbeddingModel,
+      embeddingMaxInputTokens: usedEmbeddingMaxInputTokens,
+    }
     newLibraryIndexConfig.value = {
-      embeddingModel: 'text-embedding-v1',
-      embeddingMaxInputTokens: 2048,
+      embeddingModel: usedEmbeddingModel,
+      embeddingMaxInputTokens: usedEmbeddingMaxInputTokens,
       chunkMode: 'recursive',
     }
     clearNewLibraryFieldErrors()
@@ -1348,6 +1424,12 @@ async function sendMessage() {
     return
   }
 
+  if (!isGlobalLlmConfigComplete.value) {
+    clearFeedback()
+    errorMessage.value = '请先在“模型配置”中填写 LLM、上下文长度和 API_KEY。'
+    return
+  }
+
   clearFeedback()
   isSending.value = true
 
@@ -1869,6 +1951,7 @@ async function configureLibrary() {
 async function syncLibraryInBackground() {
   clearFeedback()
   clearSyncFeedback()
+  const syncStartedAtMs = Date.now()
 
   if (activeLibraryId.value === null) {
     errorMessage.value = '请先配置文献库。'
@@ -1883,12 +1966,11 @@ async function syncLibraryInBackground() {
     return
   }
 
+  activeSyncLibraryName.value = activeLibrary.value?.name ?? ''
   syncing.value = true
   activeSyncJobId.value = null
   syncStatusMessageIsError.value = false
-  syncStatusMessage.value = activeLibraryName.value
-    ? `正在同步文献库“${activeLibraryName.value}”...`
-    : '正在同步文献库...'
+  syncStatusMessage.value = buildSyncLibraryPendingMessage(activeSyncLibraryName.value)
 
   try {
     const startPayload = await postJson<SyncJobStatusResponse>(
@@ -1907,13 +1989,14 @@ async function syncLibraryInBackground() {
     applyLibrarySelection(activeLibraryId.value)
     clearSyncFeedback()
     statusMessageIsError.value = (finalPayload.failed_count ?? 0) > 0
-    statusMessage.value = buildSyncSummaryMessage(finalPayload)
+    statusMessage.value = buildSyncSummaryMessage(finalPayload, syncStartedAtMs)
   } catch (error) {
     clearSyncFeedback()
     errorMessage.value = extractErrorMessage(error, '同步本地文献文件夹失败。')
   } finally {
     syncing.value = false
     activeSyncJobId.value = null
+    activeSyncLibraryName.value = ''
   }
 }
 
@@ -1923,13 +2006,19 @@ function updateSyncStatusMessage(payload: SyncJobStatusResponse) {
   }
 
   if ((payload.total_count ?? 0) > 0 && payload.current_file_name) {
-    syncStatusMessage.value = `当前正在同步文件 ${payload.current_index ?? 0}/${payload.total_count ?? 0}：${payload.current_file_name}`
+    const libraryName = payload.library?.name || activeSyncLibraryName.value
+    const libraryText = libraryName ? `“${libraryName}” ` : ''
+    syncStatusMessage.value =
+      `当前正在同步文献库${libraryText}${payload.current_index ?? 0}/${payload.total_count ?? 0}：${payload.current_file_name}`
     return
   }
 
-  syncStatusMessage.value = activeLibraryName.value
-    ? `正在同步文献库“${activeLibraryName.value}”...`
-    : '正在同步文献库...'
+  syncStatusMessage.value = buildSyncLibraryPendingMessage(payload.library?.name || activeSyncLibraryName.value)
+}
+
+function buildSyncLibraryPendingMessage(libraryName: string) {
+  const libraryText = libraryName ? `“${libraryName}”` : ''
+  return `当前正在同步文献库${libraryText}...`
 }
 
 async function pollSyncJobUntilFinished(jobId: number): Promise<SyncJobStatusResponse> {
@@ -1966,8 +2055,10 @@ function waitForSyncPoll(delayMs: number) {
 }
 
 
-function buildSyncSummaryMessage(payload: FolderSyncResponse) {
-  const summary = `本次同步结果：新增 ${payload.new_count ?? 0} 篇，跳过 ${payload.skipped_count ?? 0} 篇，失败 ${payload.failed_count ?? 0} 篇。`
+function buildSyncSummaryMessage(payload: FolderSyncResponse, fallbackStartedAtMs?: number) {
+  const elapsedSeconds = calculateSyncElapsedSeconds(payload, fallbackStartedAtMs)
+  const elapsedText = formatSyncElapsedSeconds(elapsedSeconds)
+  const summary = `本次同步结果：新增 ${payload.new_count ?? 0} 篇，跳过 ${payload.skipped_count ?? 0} 篇，失败 ${payload.failed_count ?? 0} 篇，用时 ${elapsedText} 秒`
   const failureReasons = [
     ...new Set(
       (payload.results ?? [])
@@ -1982,6 +2073,30 @@ function buildSyncSummaryMessage(payload: FolderSyncResponse) {
   }
 
   return `${summary}\n失败原因：${failureReasons.join('\n')}`
+}
+
+// 计算同步用时：优先使用后端持久化时间，缺失时使用前端本地计时兜底。
+function calculateSyncElapsedSeconds(payload: FolderSyncResponse, fallbackStartedAtMs?: number) {
+  const startedAtMs = payload.started_at ? Date.parse(payload.started_at) : Number.NaN
+  const finishedAtMs = payload.finished_at ? Date.parse(payload.finished_at) : Number.NaN
+  if (Number.isFinite(startedAtMs) && Number.isFinite(finishedAtMs) && finishedAtMs >= startedAtMs) {
+    return (finishedAtMs - startedAtMs) / 1000
+  }
+
+  if (fallbackStartedAtMs !== undefined) {
+    return Math.max(0, (Date.now() - fallbackStartedAtMs) / 1000)
+  }
+
+  return 0
+}
+
+// 格式化同步用时，短任务保留 1 位小数，较长任务取整，方便状态栏快速阅读。
+function formatSyncElapsedSeconds(seconds: number) {
+  const normalizedSeconds = Math.max(0, seconds)
+  if (normalizedSeconds < 10) {
+    return normalizedSeconds.toFixed(1).replace(/\.0$/, '')
+  }
+  return String(Math.round(normalizedSeconds))
 }
 
 async function fetchJson<T>(endpoint: string): Promise<T> {
@@ -2333,6 +2448,7 @@ function citationBindingToDocument(citation: CitationBinding): RetrievedDocument
   return {
     document_id: citation.document_id,
     source_id: citation.source_id,
+    source_type: citation.source_type,
     title: citation.title,
     abstract: citation.abstract,
     file_path: citation.file_path,
@@ -2342,6 +2458,18 @@ function citationBindingToDocument(citation: CitationBinding): RetrievedDocument
     doi: citation.doi,
     url: citation.url,
     citation_text_default: citation.citation_text_default || citation.text,
+    publisher: citation.publisher,
+    publisher_place: citation.publisher_place,
+    volume: citation.volume,
+    issue: citation.issue,
+    pages: citation.pages,
+    article_number: citation.article_number,
+    degree_institution: citation.degree_institution,
+    degree_location: citation.degree_location,
+    proceedings_title: citation.proceedings_title,
+    conference_name: citation.conference_name,
+    publication_date: citation.publication_date,
+    document_type: citation.document_type,
     chunk_index: citation.chunk_index,
     chunk_text: citation.chunk_text || '',
   }
@@ -2356,6 +2484,11 @@ function isExternalRetrievedDocument(document: RetrievedDocument | null) {
 }
 
 function formatGb7714Citation(document: RetrievedDocument) {
+  const citationText = document.citation_text_default?.trim()
+  if (citationText) {
+    return citationText
+  }
+
   const authors = (document.authors || []).filter((item) => item.trim().length > 0)
   const authorText = authors.length > 0 ? authors.join(', ') : '作者未知'
   const title = document.title?.trim() || '未命名文献'
@@ -2677,7 +2810,7 @@ function isReferenceExpanded(messageId: number, referenceNumber: number) {
         </div>
 
         <div
-          v-if="syncing && syncStatusMessage && !isHomeView"
+          v-if="syncing && syncStatusMessage"
           class="status-box status-box--sticky"
           :class="syncStatusMessageIsError ? 'status-box--error' : 'status-box--success'"
         >
@@ -3004,6 +3137,8 @@ function isReferenceExpanded(messageId: number, referenceNumber: number) {
       <div v-if="libraryDetails" class="library-details__body">
         <div class="library-details__meta">
           <p><strong>名称：</strong>{{ libraryDetails.name }}</p>
+          <p><strong>向量模型：</strong>{{ libraryDetails.embedding_model || '未配置' }}</p>
+          <p><strong>向量模型最大单次输入 Token 数：</strong>{{ libraryDetails.embedding_max_input_tokens || '未配置' }}</p>
           <p><strong>文献数量：</strong>{{ libraryDetails.document_count }}</p>
           <p><strong>文件夹：</strong>{{ libraryDetails.folder_path || '未配置文件夹' }}</p>
           <p><strong>创建时间：</strong>{{ formatDateTime(libraryDetails.created_at) }}</p>
@@ -3054,6 +3189,31 @@ function isReferenceExpanded(messageId: number, referenceNumber: number) {
                         <p><strong>关键词：</strong>{{ libraryDocumentDetails.keywords.length ? libraryDocumentDetails.keywords.join('，') : '暂无' }}</p>
                         <p><strong>年份：</strong>{{ libraryDocumentDetails.year || '暂无' }}</p>
                         <p><strong>来源：</strong>{{ libraryDocumentDetails.venue || '暂无' }}</p>
+                        <p><strong>文献类型：</strong>{{ libraryDocumentDetails.document_type || '暂无' }}</p>
+                        <p><strong>出版日期：</strong>{{ libraryDocumentDetails.publication_date || '暂无' }}</p>
+                        <p><strong>出版者：</strong>{{ libraryDocumentDetails.publisher || '暂无' }}</p>
+                        <p><strong>出版地：</strong>{{ libraryDocumentDetails.publisher_place || '暂无' }}</p>
+                        <p><strong>卷期页码：</strong>
+                          {{
+                            [
+                              libraryDocumentDetails.volume ? `卷 ${libraryDocumentDetails.volume}` : '',
+                              libraryDocumentDetails.issue ? `期 ${libraryDocumentDetails.issue}` : '',
+                              libraryDocumentDetails.pages ? `页 ${libraryDocumentDetails.pages}` : '',
+                              libraryDocumentDetails.article_number ? `文章号 ${libraryDocumentDetails.article_number}` : '',
+                            ].filter(Boolean).join('，') || '暂无'
+                          }}
+                        </p>
+                        <p><strong>学位授予单位：</strong>{{ libraryDocumentDetails.degree_institution || '暂无' }}</p>
+                        <p><strong>学位授予地：</strong>{{ libraryDocumentDetails.degree_location || '暂无' }}</p>
+                        <p><strong>会议/论文集：</strong>{{ libraryDocumentDetails.proceedings_title || libraryDocumentDetails.conference_name || '暂无' }}</p>
+                        <p v-if="Object.keys(libraryDocumentDetails.extra_metadata || {}).length">
+                          <strong>扩展元数据：</strong>
+                          {{
+                            Object.entries(libraryDocumentDetails.extra_metadata)
+                              .map(([key, value]) => `${key}：${value}`)
+                              .join('；')
+                          }}
+                        </p>
                         <p><strong>DOI：</strong>{{ libraryDocumentDetails.doi || '暂无' }}</p>
                         <p><strong>URL：</strong>{{ libraryDocumentDetails.url || '暂无' }}</p>
                         <p><strong>引用格式：</strong>{{ libraryDocumentDetails.citation_text_default || '暂无' }}</p>
@@ -3086,7 +3246,7 @@ function isReferenceExpanded(messageId: number, referenceNumber: number) {
           <p class="dialog-card__eyebrow">Libraries</p>
           <h3>文献库配置</h3>
         </div>
-        <button class="dialog-card__close" type="button" :disabled="creatingLibrary || configuringFolder || syncing" @click="closeLibraryPanel">
+        <button class="dialog-card__close" type="button" :disabled="configuringFolder" @click="closeLibraryPanel">
           ×
         </button>
         </div>
@@ -3335,6 +3495,8 @@ function isReferenceExpanded(messageId: number, referenceNumber: number) {
 
               <label class="library-panel__field" :class="{ 'library-panel__field--error': !!modelConfigFieldErrors.llmContextLength }">
                 <span>上下文长度</span>
+                <small v-if="modelConfigFieldErrors.llmContextLength" class="library-panel__field-error">{{ modelConfigFieldErrors.llmContextLength }}</small>
+                <small class="model-config__hint">默认 200K，仅表示允许送入 LLM 的正文上下文上限。</small>
                 <input
                   v-model.number="globalModelConfig.llmContextLength"
                   type="number"
@@ -3343,8 +3505,7 @@ function isReferenceExpanded(messageId: number, referenceNumber: number) {
                   placeholder="200000"
                   @input="modelConfigFieldErrors.llmContextLength = ''"
                 />
-                <small v-if="modelConfigFieldErrors.llmContextLength" class="library-panel__field-error">{{ modelConfigFieldErrors.llmContextLength }}</small>
-                <small class="model-config__hint">默认 200K，仅表示允许送入 LLM 的正文上下文上限。</small>
+
               </label>
 
               <label class="library-panel__field model-config-field--full" :class="{ 'library-panel__field--error': !!modelConfigFieldErrors.apiKey }">

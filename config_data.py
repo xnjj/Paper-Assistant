@@ -13,12 +13,6 @@ ROOT_DIR = Path(__file__).resolve().parent
 # ---------------------------- 环境配置 ----------------------------
 OPENAI_API_KEY = os.getenv("DASHSCOPE_API_KEY", "")
 
-# ---------------------------- 本地存储配置 ----------------------------
-LLM_MODEL_NAME = "qwen3-max"
-EMBEDDING_MODEL_NAME = "text-embedding-v1"
-DOCUMENT_CHUNK_MAX_CHARS = 2048
-MODEL_MAX_CONTEXT_LENGTH = 20_000
-
 # ---------------------------- 检索配置 ----------------------------
 # TOP_K 是本地向量召回候选 chunk 数；RECALL_K 是本地重排后保留并送入问答的 chunk 数。
 TOP_K = 100
@@ -27,6 +21,8 @@ CHUNK_LIMIT_PER_PAPER = 2
 
 # 外部检索与最终证据拼接上限。
 MAX_PARALLEL_EXTERNAL_QUERIES = 3
+MAX_PARALLEL_CROSSREF_QUERIES = 5
+MAX_PARALLEL_LLM_QUERIES = 10
 MAX_EXTERNAL_QUERY_LIMIT = 5
 MAX_SOURCE_FINAL_LIMIT = 10
 DEFAULT_EXTERNAL_FINAL_LIMIT = 20

@@ -37,6 +37,19 @@ class ExtractedMetadata:
     venue: str = ""
     citation_text_default: str = ""
     language: str = "zh"
+    publication_date: str = ""
+    document_type: str = ""
+    publisher: str = ""
+    publisher_place: str = ""
+    volume: str = ""
+    issue: str = ""
+    pages: str = ""
+    article_number: str = ""
+    degree_institution: str = ""
+    degree_location: str = ""
+    proceedings_title: str = ""
+    conference_name: str = ""
+    extra_metadata: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -63,6 +76,19 @@ class DocumentRecord:
     status: str
     created_at: str
     updated_at: str
+    publication_date: str = ""
+    document_type: str = ""
+    publisher: str = ""
+    publisher_place: str = ""
+    volume: str = ""
+    issue: str = ""
+    pages: str = ""
+    article_number: str = ""
+    degree_institution: str = ""
+    degree_location: str = ""
+    proceedings_title: str = ""
+    conference_name: str = ""
+    extra_metadata_json: str = "{}"
 
 
 @dataclass

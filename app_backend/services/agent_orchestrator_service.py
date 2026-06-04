@@ -510,11 +510,10 @@ class AgentOrchestratorService:
 
     def _build_coverage_model(self) -> ChatTongyi:
         """根据当前全局配置创建用于证据充分性判断的模型实例。"""
-        model_name = config.LLM_MODEL_NAME
-        api_key = config.OPENAI_API_KEY
-        if self.config_service is not None:
-            model_name = self.config_service.get_llm_model_name()
-            api_key = self.config_service.get_api_key()
+        if self.config_service is None:
+            raise ValueError("模型配置服务未初始化，请先完成模型配置。")
+        model_name = self.config_service.get_llm_model_name()
+        api_key = self.config_service.get_api_key()
 
         return ChatTongyi(
             model=model_name,
@@ -864,6 +863,19 @@ class AgentOrchestratorService:
                     "doi": candidate.doi,
                     "url": candidate.url,
                     "citation_text_default": candidate.citation_text_default or candidate.title,
+                    "publisher": candidate.publisher,
+                    "publisher_place": candidate.publisher_place,
+                    "volume": candidate.volume,
+                    "issue": candidate.issue,
+                    "pages": candidate.pages,
+                    "article_number": candidate.article_number,
+                    "degree_institution": candidate.degree_institution,
+                    "degree_location": candidate.degree_location,
+                    "proceedings_title": candidate.proceedings_title,
+                    "conference_name": candidate.conference_name,
+                    "publication_date": candidate.publication_date,
+                    "document_type": candidate.document_type,
+                    "metadata_sources": candidate.metadata_sources or [candidate.source],
                     "file_path": "",
                     "chunk_index": index,
                     "chunk_text": candidate.abstract,

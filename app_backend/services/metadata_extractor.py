@@ -10,7 +10,6 @@ from langchain_community.chat_models import ChatTongyi
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
 
-import config_data as config
 from app_backend.models import ExtractedMetadata, ParsedDocument
 from app_backend.services.citation_formatter import format_gbt7714_citation
 from app_backend.services.config_service import ConfigService
@@ -135,8 +134,15 @@ class MetadataExtractorService:
                     "JSON 的字段必须严格使用以下英文字段名："
                     "{{\"title\": str, \"abstract\": str, \"keywords\": [str], "
                     "\"authors\": [str], \"year\": str, \"doi\": str, "
-                    "\"url\": str, \"venue\": str, \"language\": str}}。"
+                    "\"url\": str, \"venue\": str, \"language\": str, "
+                    "\"publication_date\": str, \"document_type\": str, "
+                    "\"publisher\": str, \"publisher_place\": str, "
+                    "\"volume\": str, \"issue\": str, \"pages\": str, "
+                    "\"article_number\": str, \"degree_institution\": str, "
+                    "\"degree_location\": str, \"proceedings_title\": str, "
+                    "\"conference_name\": str, \"extra_metadata\": object}}。"
                     "其中 authors 必须是作者姓名列表，不能写作者单位。"
+                    "document_type 只能优先使用 J、J/OL、C、D、M、R、EB/OL 等 GB/T 类型标识。"
                     "keywords 必须尽量从论文中提取，如果出现“关键词”或“Keywords”字段，优先使用它。"
                     "未知字段请返回空字符串或空数组。",
                 ),
@@ -161,11 +167,10 @@ class MetadataExtractorService:
 
     def _build_model(self) -> ChatTongyi:
         """Build one model instance from the active runtime config."""
-        model_name = config.LLM_MODEL_NAME
-        api_key = config.OPENAI_API_KEY
-        if self.config_service is not None:
-            model_name = self.config_service.get_llm_model_name()
-            api_key = self.config_service.get_api_key()
+        if self.config_service is None:
+            raise ValueError("模型配置服务未初始化，请先完成模型配置。")
+        model_name = self.config_service.get_llm_model_name()
+        api_key = self.config_service.get_api_key()
 
         return ChatTongyi(
             model=model_name,
@@ -207,6 +212,23 @@ class MetadataExtractorService:
             or ""
         )
         language = self._normalize_language(payload.get("language"), title, abstract)
+        publication_date = self._normalize_date(payload.get("publication_date")) or str(rule_hints.get("publication_date", ""))
+        document_type = (
+            self._normalize_document_type(payload.get("document_type"))
+            or self._normalize_document_type(rule_hints.get("document_type"))
+            or self._infer_document_type(title=title, venue=venue, url=url)
+        )
+        publisher = self._clean_text(payload.get("publisher"))
+        publisher_place = self._clean_text(payload.get("publisher_place"))
+        volume = self._clean_text(payload.get("volume"))
+        issue = self._clean_text(payload.get("issue"))
+        pages = self._normalize_pages(payload.get("pages"))
+        article_number = self._clean_text(payload.get("article_number"))
+        degree_institution = self._clean_text(payload.get("degree_institution"))
+        degree_location = self._clean_text(payload.get("degree_location"))
+        proceedings_title = self._clean_text(payload.get("proceedings_title"))
+        conference_name = self._clean_text(payload.get("conference_name"))
+        extra_metadata = self._normalize_extra_metadata(payload.get("extra_metadata"))
 
         if doi and not url:
             url = f"https://doi.org/{doi}"
@@ -218,6 +240,18 @@ class MetadataExtractorService:
             venue=venue,
             doi=doi,
             url=url,
+            publication_date=publication_date,
+            document_type=document_type,
+            publisher=publisher,
+            publisher_place=publisher_place,
+            volume=volume,
+            issue=issue,
+            pages=pages,
+            article_number=article_number,
+            degree_institution=degree_institution,
+            degree_location=degree_location,
+            proceedings_title=proceedings_title,
+            conference_name=conference_name,
         )
 
         return ExtractedMetadata(
@@ -231,6 +265,19 @@ class MetadataExtractorService:
             venue=venue,
             citation_text_default=citation_text_default,
             language=language,
+            publication_date=publication_date,
+            document_type=document_type,
+            publisher=publisher,
+            publisher_place=publisher_place,
+            volume=volume,
+            issue=issue,
+            pages=pages,
+            article_number=article_number,
+            degree_institution=degree_institution,
+            degree_location=degree_location,
+            proceedings_title=proceedings_title,
+            conference_name=conference_name,
+            extra_metadata=extra_metadata,
         )
 
     def _extract_rule_hints(self, parsed_document: ParsedDocument) -> dict[str, object]:
@@ -249,6 +296,7 @@ class MetadataExtractorService:
         doi = self._extract_doi(priority_text) or self._extract_doi(parsed_document.raw_text)
         url = self._extract_url(priority_text) or self._extract_url(parsed_document.raw_text)
 
+        venue = self._extract_venue_hint(lines)
         return {
             "title": self._extract_title_hint(lines),
             "abstract": self._extract_abstract_hint(priority_text),
@@ -257,7 +305,12 @@ class MetadataExtractorService:
             "year": self._extract_year_hint(priority_text, lines),
             "doi": doi,
             "url": url or (f"https://doi.org/{doi}" if doi else ""),
-            "venue": self._extract_venue_hint(lines),
+            "venue": venue,
+            "document_type": self._infer_document_type(
+                title=self._extract_title_hint(lines),
+                venue=venue,
+                url=url,
+            ),
         }
 
     def _normalize_lines(self, text: str) -> list[str]:
@@ -485,6 +538,104 @@ class MetadataExtractorService:
         match = _URL_PATTERN.search(text)
         return match.group(0).rstrip(".,);]") if match else ""
 
+    def _normalize_date(self, value: object) -> str:
+        """把出版日期规范为 YYYY-MM-DD、YYYY-MM 或 YYYY，无法识别时返回空字符串。"""
+        text = self._clean_text(value)
+        if not text:
+            return ""
+        match = re.search(r"\b(19\d{2}|20\d{2})(?:[-/.年](\d{1,2})(?:[-/.月](\d{1,2}))?)?", text)
+        if not match:
+            return ""
+        year = match.group(1)
+        month = match.group(2)
+        day = match.group(3)
+        if month and day:
+            return f"{year}-{int(month):02d}-{int(day):02d}"
+        if month:
+            return f"{year}-{int(month):02d}"
+        return year
+
+    def _normalize_pages(self, value: object) -> str:
+        """清洗页码字段，统一常见连接符并移除首尾多余标点。"""
+        text = self._clean_text(value)
+        if not text:
+            return ""
+        return text.replace("--", "-").replace("–", "-").replace("—", "-").strip(" :.,;，；")
+
+    def _normalize_document_type(self, value: object) -> str:
+        """把模型返回的文献类型规范为 GB/T 常见类型标识。"""
+        text = self._clean_text(value).lower().strip("[]")
+        if not text:
+            return ""
+        type_aliases = {
+            "journal": "J",
+            "journal article": "J",
+            "journal-article": "J",
+            "article": "J",
+            "期刊": "J",
+            "期刊论文": "J",
+            "j": "J",
+            "j/ol": "J/OL",
+            "online journal": "J/OL",
+            "conference": "C",
+            "conference paper": "C",
+            "proceedings": "C",
+            "会议": "C",
+            "会议论文": "C",
+            "c": "C",
+            "dissertation": "D",
+            "thesis": "D",
+            "degree thesis": "D",
+            "学位论文": "D",
+            "博士论文": "D",
+            "硕士论文": "D",
+            "d": "D",
+            "book": "M",
+            "monograph": "M",
+            "图书": "M",
+            "专著": "M",
+            "m": "M",
+            "report": "R",
+            "technical report": "R",
+            "报告": "R",
+            "r": "R",
+            "preprint": "EB/OL",
+            "online": "EB/OL",
+            "web": "EB/OL",
+            "eb/ol": "EB/OL",
+            "ebol": "EB/OL",
+            "电子资源": "EB/OL",
+        }
+        return type_aliases.get(text, text.upper())
+
+    def _infer_document_type(self, *, title: str, venue: str, url: str) -> str:
+        """根据标题、来源和链接粗略推断文献类型，作为 LLM 漏填时的兜底。"""
+        sample = f"{title} {venue} {url}".lower()
+        if re.search(r"(学位论文|博士论文|硕士论文|dissertation|thesis)", sample):
+            return "D"
+        if re.search(r"(conference|proceedings|symposium|workshop|会议|大会|论文集)", sample):
+            return "C"
+        if re.search(r"(arxiv|preprint|online|web|网页|网络首发|urlid)", sample):
+            return "J/OL" if venue else "EB/OL"
+        if venue:
+            return "J"
+        if url:
+            return "EB/OL"
+        return ""
+
+    def _normalize_extra_metadata(self, value: object) -> dict[str, str]:
+        """规范化扩展元数据字典，只保留可序列化的短文本键值。"""
+        if not isinstance(value, dict):
+            return {}
+        normalized: dict[str, str] = {}
+        for key, item in value.items():
+            key_text = self._clean_text(key)
+            value_text = self._clean_text(item)
+            if not key_text or not value_text:
+                continue
+            normalized[key_text[:80]] = value_text[:500]
+        return normalized
+
     def _normalize_language(self, value: object, title: str, abstract: str) -> str:
         """把语言字段规范成 `zh` 或 `en`。"""
         if isinstance(value, str):
@@ -563,16 +714,40 @@ class MetadataExtractorService:
         venue: str,
         doi: str,
         url: str,
+        publication_date: str,
+        document_type: str,
+        publisher: str,
+        publisher_place: str,
+        volume: str,
+        issue: str,
+        pages: str,
+        article_number: str,
+        degree_institution: str,
+        degree_location: str,
+        proceedings_title: str,
+        conference_name: str,
     ) -> str:
         """生成近似 GB/T 7714-2015 的默认引用字符串。"""
         return format_gbt7714_citation(
             authors=authors,
             title=title,
-            year=year,
+            year=publication_date or year,
             venue=venue,
             doi=doi,
             url=url,
             source_type="local",
+            publication_date=publication_date,
+            document_type=document_type,
+            publisher=publisher,
+            publisher_place=publisher_place,
+            volume=volume,
+            issue=issue,
+            pages=pages,
+            article_number=article_number,
+            degree_institution=degree_institution,
+            degree_location=degree_location,
+            proceedings_title=proceedings_title,
+            conference_name=conference_name,
         )
 
 

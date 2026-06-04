@@ -24,7 +24,6 @@ class VectorIndexService:
             chunk_overlap: Character overlap between adjacent chunks.
         """
         self.config_service = config_service
-        self.default_chunk_size = config.DOCUMENT_CHUNK_MAX_CHARS
         self.base_chunk_overlap = max(0, chunk_overlap)
         self._vector_stores: dict[tuple[str, str, str], Chroma] = {}
 
@@ -51,9 +50,7 @@ class VectorIndexService:
         practical proxy for provider token limits, so the configured maximum
         embedding input length is used as the library-level chunk budget.
         """
-        if self.config_service is None:
-            return max(1, self.default_chunk_size)
-        return max(1, self.config_service.get_embedding_max_input_tokens(library_id))
+        return max(1, self._require_config_service().get_embedding_max_input_tokens(library_id))
 
     def _get_chunk_overlap(self, chunk_size: int) -> int:
         """Clamp the overlap so it always stays smaller than the chunk size."""
@@ -67,8 +64,7 @@ class VectorIndexService:
         words and sentences intact whenever the extracted PDF text allows it.
         """
         chunk_mode = "recursive"
-        if self.config_service is not None:
-            chunk_mode = self.config_service.get_effective_chunk_mode(library_id)
+        chunk_mode = self._require_config_service().get_effective_chunk_mode(library_id)
         chunk_size = self._get_chunk_size(library_id)
         chunk_overlap = self._get_chunk_overlap(chunk_size)
 
@@ -114,15 +110,17 @@ class VectorIndexService:
 
     def _get_embedding_model_name(self, library_id: int | None = None) -> str:
         """Return the active embedding model name."""
-        if self.config_service is None:
-            return config.EMBEDDING_MODEL_NAME
-        return self.config_service.get_embedding_model_name(library_id)
+        return self._require_config_service().get_embedding_model_name(library_id)
 
     def _get_api_key(self) -> str:
         """Return the active API key used by the embedding provider."""
+        return self._require_config_service().get_api_key()
+
+    def _require_config_service(self) -> ConfigService:
+        """获取运行时配置服务；缺失时明确报错，避免静默使用默认模型。"""
         if self.config_service is None:
-            return config.OPENAI_API_KEY
-        return self.config_service.get_api_key()
+            raise ValueError("模型配置服务未初始化，请先完成应用配置。")
+        return self.config_service
 
     def index_document(
         self,
@@ -142,27 +140,35 @@ class VectorIndexService:
         created_vector_ids: list[str] = []
         embedding_model = self._get_embedding_model_name(library_id)
 
+        vector_ids = [
+            f"library-{library_id}-doc-{document_id}-chunk-{index}"
+            for index in range(len(chunks))
+        ]
+        metadatas = [
+            {
+                "library_id": library_id,
+                "document_id": document_id,
+                "chunk_index": index,
+            }
+            for index in range(len(chunks))
+        ]
+
         try:
+            # 批量写入可以让 embedding provider 走 documents 批处理，
+            # 避免每个 chunk 都单独发起一次向量化请求。
+            created_vector_ids = list(vector_ids)
+            vector_store.add_texts(
+                texts=chunks,
+                metadatas=metadatas,
+                ids=vector_ids,
+            )
             for index, chunk_text in enumerate(chunks):
-                vector_id = f"library-{library_id}-doc-{document_id}-chunk-{index}"
-                vector_store.add_texts(
-                    texts=[chunk_text],
-                    metadatas=[
-                        {
-                            "library_id": library_id,
-                            "document_id": document_id,
-                            "chunk_index": index,
-                        }
-                    ],
-                    ids=[vector_id],
-                )
-                created_vector_ids.append(vector_id)
                 indexed_chunks.append(
                     {
                         "chunk_index": index,
                         "chunk_text": chunk_text,
                         "token_count": len(chunk_text),
-                        "vector_id": vector_id,
+                        "vector_id": vector_ids[index],
                         "embedding_model": embedding_model,
                     }
                 )

@@ -3,7 +3,6 @@ from __future__ import annotations
 from datetime import datetime
 from uuid import uuid4
 
-import config_data as config
 from app_backend.db.connection import DatabaseManager
 from app_backend.models import LibraryRecord
 
@@ -57,9 +56,9 @@ class LibraryRepository:
         """Create a new library and assign it a dedicated collection name."""
         now = datetime.now().isoformat(timespec="seconds")
         collection_name = f"library_{uuid4().hex[:12]}"
-        resolved_embedding_model = (embedding_model or config.EMBEDDING_MODEL_NAME).strip()
-        resolved_embedding_max_input_tokens = int(
-            embedding_max_input_tokens or config.DOCUMENT_CHUNK_MAX_CHARS
+        resolved_embedding_model = self._require_non_empty_embedding_model(embedding_model)
+        resolved_embedding_max_input_tokens = self._require_positive_embedding_limit(
+            embedding_max_input_tokens
         )
         resolved_chunk_mode = (chunk_mode or "recursive").strip() or "recursive"
         with self.db_manager.get_connection() as connection:
@@ -106,9 +105,9 @@ class LibraryRepository:
     ) -> LibraryRecord:
         """Create a library with an explicit collection name for legacy migration."""
         now = datetime.now().isoformat(timespec="seconds")
-        resolved_embedding_model = (embedding_model or config.EMBEDDING_MODEL_NAME).strip()
-        resolved_embedding_max_input_tokens = int(
-            embedding_max_input_tokens or config.DOCUMENT_CHUNK_MAX_CHARS
+        resolved_embedding_model = self._require_non_empty_embedding_model(embedding_model)
+        resolved_embedding_max_input_tokens = self._require_positive_embedding_limit(
+            embedding_max_input_tokens
         )
         resolved_chunk_mode = (chunk_mode or "recursive").strip() or "recursive"
         with self.db_manager.get_connection() as connection:
@@ -228,3 +227,22 @@ class LibraryRepository:
                 (library_id,),
             )
             return cursor.rowcount > 0
+
+    @staticmethod
+    def _require_non_empty_embedding_model(value: str | None) -> str:
+        """校验文献库级向量模型，禁止仓储层静默写入默认模型。"""
+        normalized = (value or "").strip()
+        if not normalized:
+            raise ValueError("Embedding model cannot be empty.")
+        return normalized
+
+    @staticmethod
+    def _require_positive_embedding_limit(value: int | None) -> int:
+        """校验文献库级向量模型输入上限，禁止仓储层静默写入默认分块长度。"""
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("embedding_max_input_tokens must be a positive integer.") from exc
+        if parsed <= 0:
+            raise ValueError("embedding_max_input_tokens must be a positive integer.")
+        return parsed

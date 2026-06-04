@@ -24,6 +24,19 @@ class ExternalPaperCandidate:
     pdf_url: str | None = None
     relevance_score: float | None = None
     matched_query: str = ""
+    publisher: str = ""
+    publisher_place: str = ""
+    volume: str = ""
+    issue: str = ""
+    pages: str = ""
+    article_number: str = ""
+    degree_institution: str = ""
+    degree_location: str = ""
+    proceedings_title: str = ""
+    conference_name: str = ""
+    publication_date: str = ""
+    document_type: str = ""
+    metadata_sources: list[str] = field(default_factory=list)
 
 
 @dataclass

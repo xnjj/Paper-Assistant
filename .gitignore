@@ -21,5 +21,7 @@ dist-backend/
 build/pyinstaller/
 daily_papers/
 
+habit.md
+query.md
 .DS_Store
 Thumbs.db

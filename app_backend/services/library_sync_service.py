@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 import json
 from pathlib import Path
 import threading
 
 import config_data as config
-from app_backend.models import LibraryRecord
+from app_backend.models import DocumentRecord, IngestResult, LibraryRecord
 from app_backend.repositories.document_repository import DocumentRepository
 from app_backend.repositories.library_repository import LibraryRepository
 from app_backend.repositories.sync_repository import SyncRepository
@@ -97,6 +98,19 @@ class LibrarySyncService:
             "doi": document.doi,
             "url": document.url,
             "venue": document.venue,
+            "publication_date": document.publication_date,
+            "document_type": document.document_type,
+            "publisher": document.publisher,
+            "publisher_place": document.publisher_place,
+            "volume": document.volume,
+            "issue": document.issue,
+            "pages": document.pages,
+            "article_number": document.article_number,
+            "degree_institution": document.degree_institution,
+            "degree_location": document.degree_location,
+            "proceedings_title": document.proceedings_title,
+            "conference_name": document.conference_name,
+            "extra_metadata": self._parse_json_dict(document.extra_metadata_json),
             "citation_text_default": self._format_document_citation(
                 authors=authors,
                 title=document.title,
@@ -105,6 +119,18 @@ class LibrarySyncService:
                 doi=document.doi,
                 url=document.url,
                 source_type=document.source_type,
+                publication_date=document.publication_date,
+                document_type=document.document_type,
+                publisher=document.publisher,
+                publisher_place=document.publisher_place,
+                volume=document.volume,
+                issue=document.issue,
+                pages=document.pages,
+                article_number=document.article_number,
+                degree_institution=document.degree_institution,
+                degree_location=document.degree_location,
+                proceedings_title=document.proceedings_title,
+                conference_name=document.conference_name,
                 fallback=document.citation_text_default,
             ),
             "source_type": document.source_type,
@@ -120,8 +146,8 @@ class LibrarySyncService:
         name: str,
         description: str = "",
         folder_path: str = "",
-        embedding_model: str = config.EMBEDDING_MODEL_NAME,
-        embedding_max_input_tokens: int = config.DOCUMENT_CHUNK_MAX_CHARS,
+        embedding_model: str | None = None,
+        embedding_max_input_tokens: int | None = None,
         chunk_mode: str = "recursive",
     ) -> dict:
         """Create a new logical library."""
@@ -535,11 +561,9 @@ class LibrarySyncService:
             library = self._require_library(library_id)
             pdf_paths = self._list_pdf_paths(normalized_path)
             file_count = len(pdf_paths)
-            path_states = [
-                (pdf_path, self._lookup_existing_document(library.id, pdf_path))
-                for pdf_path in pdf_paths
-            ]
-            pending_new_count = sum(1 for _, existing_document in path_states if existing_document is None)
+            path_states = self._build_sync_path_states(library, pdf_paths)
+            pending_items = [item for item in path_states if item["requires_ingest"]]
+            pending_new_count = len(pending_items)
             self._update_job_state(
                 job_id,
                 library=self.get_library(library.id),
@@ -548,32 +572,19 @@ class LibrarySyncService:
                 total_count=pending_new_count,
             )
 
-            for pdf_path, existing_document in path_states:
-                if existing_document is None:
-                    current_new_index += 1
-                    self._update_job_state(
-                        job_id,
-                        current_index=current_new_index,
-                        total_count=pending_new_count,
-                        current_file_name=Path(pdf_path).name,
-                        current_file_path=pdf_path,
-                    )
-
-                result = self.ingest_service.ingest_path(
-                    pdf_path,
-                    source_type="local_folder",
-                    library_id=library.id,
+            for item in path_states:
+                if item["requires_ingest"]:
+                    continue
+                result = self._build_duplicate_result(
+                    library=library,
+                    pdf_path=str(item["pdf_path"]),
+                    file_hash=str(item["file_hash"]),
+                    existing_document=item["existing_document"],
                 )
                 result_payload = result.__dict__
                 results.append(result_payload)
 
-                if result.status == "saved":
-                    new_count += 1
-                elif result.status == "duplicate":
-                    skipped_count += 1
-                else:
-                    failed_count += 1
-
+                skipped_count += 1
                 self.sync_repository.add_item(
                     job_id=job_id,
                     file_path=result.path,
@@ -589,6 +600,72 @@ class LibrarySyncService:
                     failed_count=failed_count,
                     results=list(results),
                 )
+
+            max_workers = max(1, min(config.MAX_PARALLEL_LLM_QUERIES, len(pending_items))) if pending_items else 1
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                future_to_item = {
+                    executor.submit(
+                        self.ingest_service.prepare_ingest_payload,
+                        str(item["pdf_path"]),
+                        "local_folder",
+                    ): item
+                    for item in pending_items
+                }
+
+                for future in as_completed(future_to_item):
+                    item = future_to_item[future]
+                    pdf_path = str(item["pdf_path"])
+                    current_new_index += 1
+                    self._update_job_state(
+                        job_id,
+                        current_index=current_new_index,
+                        total_count=pending_new_count,
+                        current_file_name=Path(pdf_path).name,
+                        current_file_path=pdf_path,
+                    )
+
+                    try:
+                        prepared_payload = future.result()
+                        result = self.ingest_service.persist_prepared_payload(
+                            prepared_payload=prepared_payload,
+                            library=library,
+                        )
+                    except Exception as exc:
+                        result = IngestResult(
+                            path=pdf_path,
+                            success=False,
+                            status="failed",
+                            library_id=library.id,
+                            file_hash=str(item["file_hash"]),
+                            document_id=None,
+                            error=str(exc),
+                        )
+
+                    result_payload = result.__dict__
+                    results.append(result_payload)
+
+                    if result.status == "saved":
+                        new_count += 1
+                    elif result.status == "duplicate":
+                        skipped_count += 1
+                    else:
+                        failed_count += 1
+
+                    self.sync_repository.add_item(
+                        job_id=job_id,
+                        file_path=result.path,
+                        file_hash=result.file_hash,
+                        document_id=result.document_id,
+                        status=result.status,
+                        message=result.error,
+                    )
+                    self._update_job_state(
+                        job_id,
+                        new_count=new_count,
+                        skipped_count=skipped_count,
+                        failed_count=failed_count,
+                        results=list(results),
+                    )
 
             self.sync_repository.finish_job(
                 job_id=job_id,
@@ -647,6 +724,46 @@ class LibrarySyncService:
                 if running_job_id == job_id:
                     self._running_jobs_by_library.pop(library_id, None)
 
+    def _build_sync_path_states(self, library: LibraryRecord, pdf_paths: list[str]) -> list[dict]:
+        """在同步主线程中计算文件哈希并判断每个文件是否需要真正入库。"""
+        path_states: list[dict] = []
+        for pdf_path in pdf_paths:
+            file_hash = self.ingest_service.compute_file_hash(pdf_path)
+            existing_document = self.document_repository.get_by_file_hash(library.id, file_hash)
+            requires_ingest = (
+                existing_document is None
+                or self.ingest_service.document_needs_repair(existing_document)
+            )
+            path_states.append(
+                {
+                    "pdf_path": pdf_path,
+                    "file_hash": file_hash,
+                    "existing_document": existing_document,
+                    "requires_ingest": requires_ingest,
+                }
+            )
+        return path_states
+
+    def _build_duplicate_result(
+        self,
+        *,
+        library: LibraryRecord,
+        pdf_path: str,
+        file_hash: str,
+        existing_document: DocumentRecord | None,
+    ) -> IngestResult:
+        """为无需重新解析的重复文件构造同步结果，避免重复 PDF 解析和模型请求。"""
+        return IngestResult(
+            path=pdf_path,
+            success=True,
+            status="duplicate",
+            library_id=library.id,
+            title=getattr(existing_document, "title", ""),
+            file_hash=file_hash,
+            document_id=getattr(existing_document, "id", None),
+            error="The same file content is already stored in this library.",
+        )
+
     def _update_job_state(self, job_id: int, **updates) -> None:
         """Merge one partial progress update into the in-memory job state."""
         with self._sync_state_lock:
@@ -675,6 +792,19 @@ class LibrarySyncService:
         return [str(item) for item in parsed] if isinstance(parsed, list) else []
 
     @staticmethod
+    def _parse_json_dict(raw_value: str) -> dict[str, str]:
+        """解析数据库中保存的扩展元数据 JSON 字典。"""
+        if not raw_value.strip():
+            return {}
+        try:
+            parsed = json.loads(raw_value)
+        except json.JSONDecodeError:
+            return {}
+        if not isinstance(parsed, dict):
+            return {}
+        return {str(key): str(value) for key, value in parsed.items() if str(key).strip() and str(value).strip()}
+
+    @staticmethod
     def _format_document_citation(
         *,
         authors: list[str],
@@ -684,7 +814,19 @@ class LibrarySyncService:
         doi: str,
         url: str,
         source_type: str,
-        fallback: str,
+        publication_date: str = "",
+        document_type: str = "",
+        publisher: str = "",
+        publisher_place: str = "",
+        volume: str = "",
+        issue: str = "",
+        pages: str = "",
+        article_number: str = "",
+        degree_institution: str = "",
+        degree_location: str = "",
+        proceedings_title: str = "",
+        conference_name: str = "",
+        fallback: str = "",
     ) -> str:
         """为文献详情接口生成近似 GB/T 7714-2015 的引用文本。"""
         citation = format_gbt7714_citation(
@@ -695,6 +837,18 @@ class LibrarySyncService:
             doi=doi,
             url=url,
             source_type=source_type or "local",
+            publication_date=publication_date,
+            document_type=document_type,
+            publisher=publisher,
+            publisher_place=publisher_place,
+            volume=volume,
+            issue=issue,
+            pages=pages,
+            article_number=article_number,
+            degree_institution=degree_institution,
+            degree_location=degree_location,
+            proceedings_title=proceedings_title,
+            conference_name=conference_name,
         )
         return citation or fallback
 

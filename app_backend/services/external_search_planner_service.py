@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import os
 import re
 from dataclasses import asdict, dataclass
 from datetime import datetime
@@ -467,11 +466,11 @@ class ExternalSearchPlannerService:
     def _get_model_name(self) -> str:
         """读取当前 LLM 名称。"""
         if self.config_service is None:
-            return "qwen3-max"
+            raise ValueError("模型配置服务未初始化，请先完成模型配置。")
         return self.config_service.get_llm_model_name()
 
     def _get_api_key(self) -> str:
         """读取当前模型 API Key。"""
         if self.config_service is None:
-            return os.getenv("OPENAI_API_KEY") or os.getenv("DASHSCOPE_API_KEY", "")
-        return self.config_service.get_api_key() or os.getenv("OPENAI_API_KEY") or os.getenv("DASHSCOPE_API_KEY", "")
+            raise ValueError("模型配置服务未初始化，请先完成模型配置。")
+        return self.config_service.get_api_key()

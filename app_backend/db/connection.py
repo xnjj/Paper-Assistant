@@ -19,8 +19,8 @@ CREATE TABLE IF NOT EXISTS libraries (
     description TEXT NOT NULL DEFAULT '',
     folder_path TEXT NOT NULL DEFAULT '',
     collection_name TEXT NOT NULL UNIQUE,
-    embedding_model TEXT NOT NULL DEFAULT 'text-embedding-v1',
-    embedding_max_input_tokens INTEGER NOT NULL DEFAULT 2048,
+    embedding_model TEXT NOT NULL,
+    embedding_max_input_tokens INTEGER NOT NULL,
     chunk_mode TEXT NOT NULL DEFAULT 'recursive',
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
@@ -41,6 +41,19 @@ CREATE TABLE IF NOT EXISTS documents (
     url TEXT NOT NULL DEFAULT '',
     venue TEXT NOT NULL DEFAULT '',
     citation_text_default TEXT NOT NULL DEFAULT '',
+    publication_date TEXT NOT NULL DEFAULT '',
+    document_type TEXT NOT NULL DEFAULT '',
+    publisher TEXT NOT NULL DEFAULT '',
+    publisher_place TEXT NOT NULL DEFAULT '',
+    volume TEXT NOT NULL DEFAULT '',
+    issue TEXT NOT NULL DEFAULT '',
+    pages TEXT NOT NULL DEFAULT '',
+    article_number TEXT NOT NULL DEFAULT '',
+    degree_institution TEXT NOT NULL DEFAULT '',
+    degree_location TEXT NOT NULL DEFAULT '',
+    proceedings_title TEXT NOT NULL DEFAULT '',
+    conference_name TEXT NOT NULL DEFAULT '',
+    extra_metadata_json TEXT NOT NULL DEFAULT '{}',
     source_type TEXT NOT NULL,
     source_uri TEXT NOT NULL,
     content_text TEXT NOT NULL,
@@ -163,11 +176,11 @@ class DatabaseManager:
         }
         if "embedding_model" not in library_columns:
             connection.execute(
-                "ALTER TABLE libraries ADD COLUMN embedding_model TEXT NOT NULL DEFAULT 'text-embedding-v1'"
+                "ALTER TABLE libraries ADD COLUMN embedding_model TEXT NOT NULL DEFAULT ''"
             )
         if "embedding_max_input_tokens" not in library_columns:
             connection.execute(
-                "ALTER TABLE libraries ADD COLUMN embedding_max_input_tokens INTEGER NOT NULL DEFAULT 2048"
+                "ALTER TABLE libraries ADD COLUMN embedding_max_input_tokens INTEGER NOT NULL DEFAULT 0"
             )
         if "chunk_mode" not in library_columns:
             connection.execute(
@@ -205,9 +218,11 @@ class DatabaseManager:
         cursor = connection.execute(
             """
             INSERT INTO libraries(
-                name, description, folder_path, collection_name, created_at, updated_at
+                name, description, folder_path, collection_name,
+                embedding_model, embedding_max_input_tokens, chunk_mode,
+                created_at, updated_at
             )
-            VALUES(?, ?, ?, ?, datetime('now'), datetime('now'))
+            VALUES(?, ?, ?, ?, '', 0, 'recursive', datetime('now'), datetime('now'))
             """,
             (
                 "迁移文献库",
@@ -295,6 +310,27 @@ class DatabaseManager:
             connection.execute(
                 "ALTER TABLE documents ADD COLUMN citation_text_default TEXT NOT NULL DEFAULT ''"
             )
+        text_metadata_defaults = {
+            "publication_date": "",
+            "document_type": "",
+            "publisher": "",
+            "publisher_place": "",
+            "volume": "",
+            "issue": "",
+            "pages": "",
+            "article_number": "",
+            "degree_institution": "",
+            "degree_location": "",
+            "proceedings_title": "",
+            "conference_name": "",
+            "extra_metadata_json": "{}",
+        }
+        for column_name, default_value in text_metadata_defaults.items():
+            if column_name not in document_columns:
+                escaped_default = default_value.replace("'", "''")
+                connection.execute(
+                    f"ALTER TABLE documents ADD COLUMN {column_name} TEXT NOT NULL DEFAULT '{escaped_default}'"
+                )
 
     def _ensure_session_columns(self, connection: sqlite3.Connection, migration_library_id: int | None) -> None:
         """Add newer session columns to older databases."""
