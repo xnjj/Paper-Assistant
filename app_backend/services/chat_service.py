@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import re
+import time
 from collections.abc import Iterator
 from dataclasses import asdict, is_dataclass
+from datetime import datetime
 from typing import Any
+from uuid import uuid4
 
 from langchain_community.chat_models import ChatTongyi
 
@@ -149,6 +152,11 @@ class ChatService:
         """处理一次流式聊天请求。"""
         context: dict[str, Any] | None = None
         preparation: dict[str, Any] | None = None
+        agent_trace = self._start_agent_trace(
+            session_id=session_id,
+            user_message=user_message,
+            allow_external_search=allow_external_search,
+        )
         
         for agent_event in self.agent_orchestrator_service.stream_prepare_chat_context(
             session_id=session_id,
@@ -165,11 +173,13 @@ class ChatService:
                     user_message=user_message,
                     allow_external_search=allow_external_search,
                 )
+                self._record_context_trace(agent_trace, context)
                 continue
             if agent_event.type == "prepare_start":
                 preparation = self._start_preparation_record()
             elif agent_event.type == "prepare_step":
                 preparation = self._record_preparation_step(preparation, agent_event.payload.get("step"))
+                self._record_prepare_step_trace(agent_trace, agent_event.payload.get("step"))
             elif agent_event.type == "prepare_done":
                 preparation = self._finish_preparation_record(
                     preparation,
@@ -194,6 +204,8 @@ class ChatService:
 
         chunks: list[str] = []
         emitted_delta = False
+        stream_error = ""
+        generation_started_at = time.perf_counter()
 
         try:
             for chunk in self._build_model(streaming=True).stream(context["prompt"]):
@@ -205,17 +217,63 @@ class ChatService:
                     chunks.append(display_chunk)
                     yield {"type": "delta", "content": display_chunk}
         except Exception as exc:
-            print(f"stream chat failed, fallback to invoke: {exc}")
+            stream_error = str(exc)
+            self._append_trace_span(
+                agent_trace,
+                name="answer_generation",
+                span_type="llm",
+                status="error",
+                input_payload={"streaming": True},
+                output_payload={"answer_chars": 0, "stream_error": stream_error},
+                metrics={"elapsed_ms": self._elapsed_ms(generation_started_at)},
+                error=stream_error,
+            )
+            raise RuntimeError(f"回答生成失败：{exc}") from exc
 
-        if emitted_delta:
-            raw_answer = "".join(chunks)
-        else:
-            raw_answer = self._invoke_model(context["prompt"])
-            if raw_answer:
-                for display_chunk in self._split_stream_text(raw_answer):
-                    yield {"type": "delta", "content": display_chunk}
+        if not emitted_delta:
+            stream_error = "模型未返回任何回答内容。"
+            self._append_trace_span(
+                agent_trace,
+                name="answer_generation",
+                span_type="llm",
+                status="error",
+                input_payload={"streaming": True},
+                output_payload={"answer_chars": 0, "stream_error": stream_error},
+                metrics={"elapsed_ms": self._elapsed_ms(generation_started_at)},
+                error=stream_error,
+            )
+            raise RuntimeError(f"回答生成失败：{stream_error}")
 
+        raw_answer = "".join(chunks)
+
+        self._append_trace_span(
+            agent_trace,
+            name="answer_generation",
+            span_type="llm",
+            status="success",
+            input_payload={
+                "streaming": True,
+                "fallback_to_invoke": False,
+            },
+            output_payload={
+                "answer_chars": len(raw_answer or ""),
+                "stream_error": stream_error,
+            },
+            metrics={"elapsed_ms": self._elapsed_ms(generation_started_at)},
+        )
+
+        citation_started_at = time.perf_counter()
         answer, citations = self._finalize_answer(raw_answer, context["retrieved_docs"])
+        self._append_trace_span(
+            agent_trace,
+            name="citation_binding",
+            span_type="citation",
+            status="success",
+            input_payload={"candidate_document_count": len(context["retrieved_docs"])},
+            output_payload={"citation_count": len(citations), "answer_chars": len(answer)},
+            metrics={"elapsed_ms": self._elapsed_ms(citation_started_at)},
+        )
+        agent_trace = self._finish_agent_trace(agent_trace, status="success")
         self._persist_chat_result(
             session_id=session_id,
             user_message=user_message,
@@ -225,8 +283,9 @@ class ChatService:
             citations=citations,
             orchestration=context.get("orchestration"),
             preparation=preparation,
+            agent_trace=agent_trace,
         )
-        yield {"type": "done", "answer": answer, "citations": citations}
+        yield {"type": "done", "answer": answer, "citations": citations, "agent_trace": agent_trace}
 
     def _build_context_from_orchestrated(
         self,
@@ -257,11 +316,16 @@ class ChatService:
             "library": orchestrated_context.library,
             "memories": prompt_payload["memories"],
             "retrieved_docs": prompt_payload["retrieved_docs"],
+            "local_documents": orchestrated_context.local_documents,
+            "external_documents": orchestrated_context.external_documents,
             "prompt": prompt,
+            "prompt_trace_preview": self._build_prompt_trace_preview(prompt),
             "retrieval_mode": prompt_payload["retrieval_mode"],
             "coverage": prompt_payload["coverage"],
             "agent_actions": prompt_payload["agent_actions"],
             "pending_ingest": prompt_payload["pending_ingest"],
+            "local_document_count": len(orchestrated_context.local_documents),
+            "external_document_count": len(orchestrated_context.external_documents),
             "orchestration": prompt_payload,
         }
 
@@ -337,6 +401,7 @@ Agent 操作记录：
         citations: list[dict[str, Any]],
         orchestration: dict[str, Any] | None = None,
         preparation: dict[str, Any] | None = None,
+        agent_trace: dict[str, Any] | None = None,
     ) -> None:
         """持久化一轮用户消息和助手回复。"""
         retrieval_context = {
@@ -348,8 +413,492 @@ Agent 操作记录：
             retrieval_context["orchestration"] = self._to_json_safe(orchestration)
         if preparation:
             retrieval_context["preparation"] = self._to_json_safe(preparation)
+        if agent_trace:
+            retrieval_context["agent_trace"] = self._to_json_safe(agent_trace)
         self.session_repository.add_message(session_id, "user", user_message)
         self.session_repository.add_message(session_id, "assistant", answer, retrieval_context=retrieval_context)
+
+    def _start_agent_trace(
+        self,
+        *,
+        session_id: int,
+        user_message: str,
+        allow_external_search: bool,
+    ) -> dict[str, Any]:
+        """创建一次问答的 Agent trace，最终随 assistant 消息持久化。"""
+        return {
+            "trace_id": uuid4().hex,
+            "session_id": session_id,
+            "user_query": user_message,
+            "allow_external_search": allow_external_search,
+            "status": "running",
+            "started_at": self._now_iso(),
+            "finished_at": None,
+            "elapsed_ms": None,
+            "spans": [],
+            "_started_perf": time.perf_counter(),
+        }
+
+    def _finish_agent_trace(self, trace: dict[str, Any], *, status: str) -> dict[str, Any]:
+        """结束 trace 并移除内部临时计时字段，保证可 JSON 持久化。"""
+        trace["status"] = status
+        trace["finished_at"] = self._now_iso()
+        trace["elapsed_ms"] = self._elapsed_ms(float(trace.get("_started_perf") or time.perf_counter()))
+        return self._strip_trace_private_fields(trace)
+
+    def _start_trace_span(
+        self,
+        trace: dict[str, Any],
+        *,
+        name: str,
+        span_type: str,
+        input_payload: dict[str, Any] | None = None,
+    ) -> None:
+        """开始一个可更新的 trace span，用于记录准备阶段这类运行中步骤。"""
+        spans = self._trace_spans(trace)
+        existing = self._find_trace_span(spans, name)
+        if existing is not None:
+            existing_input = existing.get("input") if isinstance(existing.get("input"), dict) else {}
+            existing.update(
+                {
+                    "status": "running",
+                    "started_at": existing.get("started_at") or self._now_iso(),
+                    "input": {**existing_input, **(input_payload or {})},
+                    "_started_perf": existing.get("_started_perf") or time.perf_counter(),
+                }
+            )
+            return
+
+        spans.append(
+            {
+                "span_id": name,
+                "parent_id": None,
+                "name": name,
+                "type": span_type,
+                "status": "running",
+                "started_at": self._now_iso(),
+                "finished_at": None,
+                "elapsed_ms": None,
+                "input": input_payload or {},
+                "output": {},
+                "metrics": {},
+                "error": "",
+                "_started_perf": time.perf_counter(),
+            }
+        )
+
+    def _finish_trace_span(
+        self,
+        trace: dict[str, Any],
+        *,
+        span_id: str,
+        status: str = "success",
+        output_payload: dict[str, Any] | None = None,
+        metrics: dict[str, Any] | None = None,
+        error: str = "",
+    ) -> None:
+        """结束一个运行中的 trace span，并写入输出、指标和错误信息。"""
+        spans = self._trace_spans(trace)
+        span = self._find_trace_span(spans, span_id)
+        if span is None:
+            self._append_trace_span(
+                trace,
+                name=span_id,
+                span_type="orchestrator",
+                status=status,
+                output_payload=output_payload,
+                metrics=metrics,
+                error=error,
+            )
+            return
+
+        started_perf = float(span.get("_started_perf") or time.perf_counter())
+        span.update(
+            {
+                "status": status,
+                "finished_at": self._now_iso(),
+                "elapsed_ms": self._elapsed_ms(started_perf),
+                "output": output_payload or span.get("output") or {},
+                "metrics": {**(span.get("metrics") or {}), **(metrics or {})},
+                "error": error,
+            }
+        )
+
+    def _append_trace_span(
+        self,
+        trace: dict[str, Any],
+        *,
+        name: str,
+        span_type: str,
+        status: str,
+        input_payload: dict[str, Any] | None = None,
+        output_payload: dict[str, Any] | None = None,
+        metrics: dict[str, Any] | None = None,
+        error: str = "",
+    ) -> None:
+        """追加一个已经完成的 trace span。"""
+        metric_payload = metrics or {}
+        elapsed_ms = metric_payload.get("elapsed_ms")
+        self._trace_spans(trace).append(
+            {
+                "span_id": uuid4().hex,
+                "parent_id": None,
+                "name": name,
+                "type": span_type,
+                "status": status,
+                "started_at": self._now_iso(),
+                "finished_at": self._now_iso(),
+                "elapsed_ms": elapsed_ms if isinstance(elapsed_ms, int) else None,
+                "input": input_payload or {},
+                "output": output_payload or {},
+                "metrics": metric_payload,
+                "error": error,
+            }
+        )
+
+    def _record_prepare_step_trace(self, trace: dict[str, Any], step: Any) -> None:
+        """把准备区 step 转换为 trace span，兼容本地检索和外部检索子任务。"""
+        if not isinstance(step, dict):
+            return
+
+        source = str(step.get("source") or "external")
+        status = str(step.get("status") or "running")
+        if source == "coverage":
+            self._record_coverage_trace(trace, step, status)
+            return
+
+        if source == "search_plan":
+            self._record_search_plan_trace(trace, step, status)
+            return
+
+        if source != "library":
+            self._record_external_source_trace(trace, step, status, source)
+            return
+
+        span_id = "local_retrieval"
+        input_payload = {
+            "source": source,
+            "query": step.get("query") or "",
+            "sort_by": step.get("sort_by") or "",
+            "sort_order": step.get("sort_order") or "",
+            "request_url": step.get("request_url") or "",
+        }
+
+        if status == "running":
+            self._start_trace_span(trace, name=span_id, span_type="retriever", input_payload=input_payload)
+            return
+
+        self._finish_trace_span(
+            trace,
+            span_id=span_id,
+            status="error" if status == "error" else "success",
+            output_payload={"result_count": step.get("result_count")},
+            metrics={"result_count": step.get("result_count")},
+            error=str(step.get("error") or ""),
+        )
+
+    def _record_coverage_trace(self, trace: dict[str, Any], step: dict[str, Any], status: str) -> None:
+        """记录证据充分性判断 span，耗时覆盖完整 LLM 判断调用。"""
+        span_id = "coverage_assessment"
+        if status == "running":
+            self._start_trace_span(
+                trace,
+                name=span_id,
+                span_type="llm",
+                input_payload={"source": "coverage"},
+            )
+            return
+
+        self._finish_trace_span(
+            trace,
+            span_id=span_id,
+            status="error" if status == "error" else "success",
+            output_payload={"result_count": step.get("result_count")},
+            error=str(step.get("error") or ""),
+        )
+
+    def _record_search_plan_trace(self, trace: dict[str, Any], step: dict[str, Any], status: str) -> None:
+        """记录外部检索计划生成 span，耗时覆盖 LLM 规划调用。"""
+        span_id = "search_plan_generation"
+        if status == "running":
+            self._start_trace_span(
+                trace,
+                name=span_id,
+                span_type="llm",
+                input_payload={"source": "search_plan"},
+            )
+            return
+
+        self._finish_trace_span(
+            trace,
+            span_id=span_id,
+            status="error" if status == "error" else "success",
+            output_payload={
+                "query_count": step.get("result_count"),
+                "search_plan_text": step.get("search_plan_text") or "",
+                "planned_by_model": step.get("planned_by_model"),
+            },
+            metrics={"query_count": step.get("result_count")},
+            error=str(step.get("error") or ""),
+        )
+
+    def _record_external_source_trace(
+        self,
+        trace: dict[str, Any],
+        step: dict[str, Any],
+        status: str,
+        source: str,
+    ) -> None:
+        """按数据源聚合外部检索 span，从首个子任务开始到该源所有子任务完成。"""
+        span_id = f"external_search.{source}"
+        input_payload = {
+            "source": source,
+            "query": step.get("query") or "",
+            "sort_by": step.get("sort_by") or "",
+            "sort_order": step.get("sort_order") or "",
+            "request_url": step.get("request_url") or "",
+        }
+
+        if status == "running":
+            self._start_trace_span(trace, name=span_id, span_type="mcp_tool", input_payload=input_payload)
+            self._merge_external_source_trace_input(trace, span_id, input_payload)
+            return
+
+        span = self._find_trace_span(self._trace_spans(trace), span_id)
+        if span is None:
+            self._start_trace_span(trace, name=span_id, span_type="mcp_tool", input_payload=input_payload)
+        self._merge_external_source_trace_input(trace, span_id, input_payload)
+
+        source_remaining = self._coerce_int(step.get("source_remaining"))
+        source_total = self._coerce_int(step.get("source_total"))
+        source_completed = self._coerce_int(step.get("source_completed"))
+        source_result_count = self._coerce_int(step.get("source_result_count"))
+        source_error_count = self._coerce_int(step.get("source_error_count"))
+        if source_remaining > 0:
+            span = self._find_trace_span(self._trace_spans(trace), span_id)
+            if span is not None:
+                span["metrics"] = {
+                    **(span.get("metrics") or {}),
+                    "source_total": source_total,
+                    "source_completed": source_completed,
+                    "source_result_count": source_result_count,
+                    "source_error_count": source_error_count,
+                }
+            return
+
+        source_failed = source_error_count > 0 and source_result_count <= 0
+        self._finish_trace_span(
+            trace,
+            span_id=span_id,
+            status="error" if source_failed else "success",
+            output_payload={
+                "result_count": source_result_count,
+                "source_total": source_total,
+                "source_completed": source_completed,
+                "source_error_count": source_error_count,
+            },
+            metrics={
+                "result_count": source_result_count,
+                "source_total": source_total,
+                "source_completed": source_completed,
+                "source_error_count": source_error_count,
+            },
+            error=str(step.get("error") or "") if source_failed else "",
+        )
+
+    def _merge_external_source_trace_input(
+        self,
+        trace: dict[str, Any],
+        span_id: str,
+        input_payload: dict[str, Any],
+    ) -> None:
+        """合并同一数据源的多个外部检索子任务输入，保留请求链接和 query 列表。"""
+        span = self._find_trace_span(self._trace_spans(trace), span_id)
+        if span is None:
+            return
+
+        existing_input = span.get("input") if isinstance(span.get("input"), dict) else {}
+        queries = list(existing_input.get("queries") or [])
+        request_urls = list(existing_input.get("request_urls") or [])
+        query = str(input_payload.get("query") or "").strip()
+        request_url = str(input_payload.get("request_url") or "").strip()
+        if query and query not in queries:
+            queries.append(query)
+        if request_url and request_url not in request_urls:
+            request_urls.append(request_url)
+        span["input"] = {
+            **existing_input,
+            **input_payload,
+            "queries": queries,
+            "request_urls": request_urls,
+        }
+
+    def _record_context_trace(self, trace: dict[str, Any], context: dict[str, Any]) -> None:
+        """根据编排上下文补充动作、证据合并和提示词构造等 trace span。"""
+        retrieved_docs = context.get("retrieved_docs") or []
+        local_documents = context.get("local_documents") or []
+        external_documents = context.get("external_documents") or []
+        memories = context.get("memories") or []
+        self._attach_retrieval_documents_to_trace(trace, local_documents, external_documents)
+        self._append_trace_span(
+            trace,
+            name="evidence_merge",
+            span_type="merge",
+            status="success",
+            input_payload={"retrieval_mode": context.get("retrieval_mode")},
+            output_payload={
+                "selected_document_count": len(retrieved_docs),
+                "local_document_count": context.get("local_document_count") or 0,
+                "external_document_count": context.get("external_document_count") or 0,
+                "documents": self._summarize_trace_documents(retrieved_docs),
+            },
+        )
+        self._append_trace_span(
+            trace,
+            name="prompt_build",
+            span_type="prompt",
+            status="success",
+            input_payload={
+                "memory_count": len(memories),
+                "document_count": len(retrieved_docs),
+            },
+            output_payload={
+                "prompt_preview": str(context.get("prompt_trace_preview") or ""),
+            },
+            metrics={"prompt_chars": len(str(context.get("prompt") or ""))},
+        )
+
+    def _attach_retrieval_documents_to_trace(
+        self,
+        trace: dict[str, Any],
+        local_documents: list[dict[str, Any]],
+        external_documents: list[dict[str, Any]],
+    ) -> None:
+        """把最终上下文中的检索文献补写到已完成的本地和外部检索 trace span。"""
+        local_span = self._find_trace_span(self._trace_spans(trace), "local_retrieval")
+        if local_span is not None:
+            local_span["output"] = {
+                **(local_span.get("output") or {}),
+                "documents": self._summarize_trace_documents(local_documents),
+            }
+
+        for span in self._trace_spans(trace):
+            name = str(span.get("name") or "")
+            if not name.startswith("external_search."):
+                continue
+            source = name.replace("external_search.", "", 1)
+            matched_documents = [
+                document for document in external_documents if self._document_matches_external_source(document, source)
+            ]
+            span["output"] = {
+                **(span.get("output") or {}),
+                "documents": self._summarize_trace_documents(matched_documents),
+            }
+
+    def _document_matches_external_source(self, document: dict[str, Any], source: str) -> bool:
+        """判断一条外部文献是否属于指定数据源 trace span。"""
+        normalized_source = (source or "").strip().lower()
+        source_id = str(document.get("source_id") or "").lower()
+        metadata_sources = document.get("metadata_sources")
+        if isinstance(metadata_sources, list):
+            if any(str(item).strip().lower() == normalized_source for item in metadata_sources):
+                return True
+        return source_id.startswith(f"ext_{normalized_source}_")
+
+    def _summarize_trace_documents(self, documents: list[dict[str, Any]], *, max_items: int = 30) -> list[dict[str, Any]]:
+        """把文献压缩成 trace 弹窗可读结构，避免把完整 chunk 和长摘要全部写入数据库。"""
+        summarized: list[dict[str, Any]] = []
+        for document in documents[:max_items]:
+            summarized.append(
+                {
+                    "document_id": document.get("document_id"),
+                    "source_id": document.get("source_id") or "",
+                    "source_type": document.get("source_type") or "",
+                    "title": document.get("title") or "",
+                    "authors": document.get("authors") or [],
+                    "year": document.get("year") or "",
+                    "venue": document.get("venue") or "",
+                    "doi": document.get("doi") or "",
+                    "url": document.get("url") or "",
+                    "file_path": document.get("file_path") or "",
+                    "chunk_index": document.get("chunk_index"),
+                    "rerank_score": document.get("rerank_score"),
+                    "abstract": self._truncate_trace_text(str(document.get("abstract") or ""), 500),
+                    "chunk_text": self._truncate_trace_text(str(document.get("chunk_text") or ""), 700),
+                }
+            )
+        return summarized
+
+    def _build_prompt_trace_preview(self, prompt: str) -> str:
+        """构造 trace 弹窗中的省略版 Prompt，避免重复展示已经在证据合并里展示的文献证据。"""
+        prompt_text = str(prompt or "")
+        evidence_label = "候选文献证据："
+        history_label = "最近会话历史："
+        evidence_index = prompt_text.find(evidence_label)
+        history_index = prompt_text.find(history_label)
+        if evidence_index < 0 or history_index <= evidence_index:
+            return self._truncate_trace_text(prompt_text, 20000)
+
+        evidence_content_start = evidence_index + len(evidence_label)
+        preview = (
+            prompt_text[:evidence_content_start].rstrip()
+            + "\n...\n\n"
+            + prompt_text[history_index:].lstrip()
+        )
+        return self._truncate_trace_text(preview, 20000)
+
+    def _truncate_trace_text(self, text: str, max_chars: int) -> str:
+        """限制 trace 详情文本长度，避免单轮消息的持久化体积过大。"""
+        normalized = (text or "").strip()
+        if len(normalized) <= max_chars:
+            return normalized
+        return f"{normalized[:max_chars].rstrip()}..."
+
+    @staticmethod
+    def _coerce_int(value: Any) -> int:
+        """把 trace 事件中的数字字段安全转换为整数。"""
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return 0
+
+    @staticmethod
+    def _trace_spans(trace: dict[str, Any]) -> list[dict[str, Any]]:
+        """安全读取 trace spans 列表。"""
+        spans = trace.setdefault("spans", [])
+        if not isinstance(spans, list):
+            trace["spans"] = []
+        return trace["spans"]
+
+    @staticmethod
+    def _find_trace_span(spans: list[dict[str, Any]], span_id: str) -> dict[str, Any] | None:
+        """按 span_id 或 name 查找已有 span，便于运行中事件合并。"""
+        for span in spans:
+            if span.get("span_id") == span_id or span.get("name") == span_id:
+                return span
+        return None
+
+    def _strip_trace_private_fields(self, value: Any) -> Any:
+        """递归移除 trace 中以下划线开头的内部字段。"""
+        if isinstance(value, dict):
+            return {
+                str(key): self._strip_trace_private_fields(item)
+                for key, item in value.items()
+                if not str(key).startswith("_")
+            }
+        if isinstance(value, list):
+            return [self._strip_trace_private_fields(item) for item in value]
+        return value
+
+    @staticmethod
+    def _now_iso() -> str:
+        """返回毫秒精度的本地时间字符串。"""
+        return datetime.now().isoformat(timespec="milliseconds")
+
+    @staticmethod
+    def _elapsed_ms(started_at: float) -> int:
+        """根据 perf_counter 起点计算毫秒耗时。"""
+        return max(0, int((time.perf_counter() - started_at) * 1000))
 
     def _start_preparation_record(self) -> dict[str, Any]:
         """创建本轮流式回答的准备区内存记录，最终随 assistant 消息一次性入库。"""
@@ -374,7 +923,13 @@ Agent 操作记录：
             "sort_order": str(step.get("sort_order") or "descending"),
             "request_url": str(step.get("request_url") or ""),
             "result_count": step.get("result_count"),
+            "coverage_sufficient": step.get("coverage_sufficient"),
+            "coverage_rationale": str(step.get("coverage_rationale") or ""),
+            "search_plan_text": str(step.get("search_plan_text") or ""),
+            "search_plan": step.get("search_plan"),
+            "planned_by_model": step.get("planned_by_model"),
             "error": str(step.get("error") or ""),
+            "error_kind": str(step.get("error_kind") or ""),
         }
         steps = record.setdefault("steps", [])
         if not isinstance(steps, list):

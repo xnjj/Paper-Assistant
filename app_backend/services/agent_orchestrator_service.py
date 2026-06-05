@@ -22,7 +22,6 @@ from app_backend.services.external_search_service import (
 from app_backend.services.external_search_planner_service import (
     ExternalSearchPlan,
     ExternalSearchPlannerService,
-    ExternalSearchQueryPlan,
 )
 from app_backend.services.memory_service import MemoryService
 from app_backend.services.retriever_service import RetrieverService
@@ -208,10 +207,30 @@ class AgentOrchestratorService:
                 )
             ]
             if allow_external_search:
-                coverage = self._assess_local_coverage_with_llm(
-                    user_message=user_message,
-                    local_documents=local_documents,
-                    top_k=effective_top_k,
+                yield AgentEvent(
+                    type="prepare_step",
+                    payload={"step": self._build_coverage_prepare_step("running")},
+                )
+                try:
+                    coverage = self._assess_local_coverage_with_llm(
+                        user_message=user_message,
+                        local_documents=local_documents,
+                        top_k=effective_top_k,
+                    )
+                except Exception as exc:
+                    yield AgentEvent(
+                        type="prepare_step",
+                        payload={
+                            "step": self._build_coverage_prepare_step(
+                                "error",
+                                error=f"本地文献充分性判断失败：{exc}",
+                            )
+                        },
+                    )
+                    raise RuntimeError(f"本地文献充分性判断失败：{exc}") from exc
+                yield AgentEvent(
+                    type="prepare_step",
+                    payload={"step": self._build_coverage_prepare_step("success", coverage=coverage)},
                 )
                 actions.append(
                     AgentActionRecord(
@@ -236,10 +255,30 @@ class AgentOrchestratorService:
         pending_ingest: list[PendingIngestRecord] = []
 
         if allow_external_search and coverage.should_search_external:
-            search_plan = self._build_external_search_plan(
-                user_message,
-                limit=coverage.recommended_external_limit or max(effective_top_k, config.DEFAULT_EXTERNAL_FINAL_LIMIT),
-                freshness_requested=coverage.freshness_gap_detected,
+            yield AgentEvent(
+                type="prepare_step",
+                payload={"step": self._build_search_plan_prepare_step("running")},
+            )
+            try:
+                search_plan = self._build_external_search_plan(
+                    user_message,
+                    limit=coverage.recommended_external_limit or max(effective_top_k, config.DEFAULT_EXTERNAL_FINAL_LIMIT),
+                    freshness_requested=coverage.freshness_gap_detected,
+                )
+            except Exception as exc:
+                yield AgentEvent(
+                    type="prepare_step",
+                    payload={
+                        "step": self._build_search_plan_prepare_step(
+                            "error",
+                            error=f"外部检索计划生成失败：{exc}",
+                        )
+                    },
+                )
+                raise RuntimeError(f"外部检索计划生成失败：{exc}") from exc
+            yield AgentEvent(
+                type="prepare_step",
+                payload={"step": self._build_search_plan_prepare_step("success", search_plan=search_plan)},
             )
             external_candidates: list[ExternalPaperCandidate] = []
             for search_event in self.external_search_service.iter_search_papers_batch(
@@ -332,33 +371,24 @@ class AgentOrchestratorService:
         max_rerank_score = max(rerank_scores) if rerank_scores else None
         avg_rerank_score = round(sum(rerank_scores) / len(rerank_scores), 4) if rerank_scores else None
 
-        try:
-            response = self._build_coverage_model().invoke(
-                self._build_coverage_prompt(
-                    user_message=user_message,
-                    local_documents=local_documents,
-                    unique_document_count=unique_document_count,
-                    max_rerank_score=max_rerank_score,
-                    avg_rerank_score=avg_rerank_score,
-                    top_k=top_k,
-                )
-            )
-            payload = self._parse_json_object(self._extract_model_text(response))
-            return self._coverage_from_llm_payload(
-                payload,
-                local_unique_documents=unique_document_count,
+        response = self._build_coverage_model().invoke(
+            self._build_coverage_prompt(
+                user_message=user_message,
+                local_documents=local_documents,
+                unique_document_count=unique_document_count,
                 max_rerank_score=max_rerank_score,
                 avg_rerank_score=avg_rerank_score,
                 top_k=top_k,
             )
-        except Exception as exc:
-            return self._build_coverage_fallback(
-                local_documents=local_documents,
-                local_unique_documents=unique_document_count,
-                max_rerank_score=max_rerank_score,
-                avg_rerank_score=avg_rerank_score,
-                error_message=str(exc),
-            )
+        )
+        payload = self._parse_json_object(self._extract_model_text(response))
+        return self._coverage_from_llm_payload(
+            payload,
+            local_unique_documents=unique_document_count,
+            max_rerank_score=max_rerank_score,
+            avg_rerank_score=avg_rerank_score,
+            top_k=top_k,
+        )
 
     def _build_local_only_coverage(self, local_documents: list[dict[str, Any]]) -> CoverageAssessment:
         """在未启用联网搜索时记录本地检索状态，不调用 LLM 做充分性判断。"""
@@ -739,7 +769,13 @@ class AgentOrchestratorService:
             "sort_order": str(event.get("sort_order") or "descending"),
             "request_url": str(event.get("request_url") or ""),
             "result_count": event.get("result_count"),
+            "source_total": event.get("source_total"),
+            "source_completed": event.get("source_completed"),
+            "source_remaining": event.get("source_remaining"),
+            "source_result_count": event.get("source_result_count"),
+            "source_error_count": event.get("source_error_count"),
             "error": str(event.get("error") or ""),
+            "error_kind": str(event.get("error_kind") or ""),
         }
 
     def _build_library_prepare_step(self, library_name: str, status: str, result_count: int) -> dict[str, Any]:
@@ -754,6 +790,65 @@ class AgentOrchestratorService:
             "result_count": result_count,
             "error": "",
         }
+
+    def _build_coverage_prepare_step(
+        self,
+        status: str,
+        *,
+        coverage: CoverageAssessment | None = None,
+        error: str = "",
+    ) -> dict[str, Any]:
+        """构造证据充分性判断的准备区步骤，用于 trace 记录真实 LLM 调用耗时。"""
+        return {
+            "id": "coverage-assessment",
+            "status": status,
+            "source": "coverage",
+            "query": "",
+            "sort_by": "",
+            "sort_order": "",
+            "result_count": None,
+            "coverage_sufficient": coverage.sufficient if coverage is not None else None,
+            "coverage_rationale": coverage.rationale if coverage is not None else "",
+            "error": error,
+        }
+
+    def _build_search_plan_prepare_step(
+        self,
+        status: str,
+        *,
+        search_plan: ExternalSearchPlan | None = None,
+        error: str = "",
+    ) -> dict[str, Any]:
+        """构造外部检索计划生成步骤，用于准备区展示和 trace 记录 LLM 规划耗时。"""
+        return {
+            "id": "external-search-plan",
+            "status": status,
+            "source": "search_plan",
+            "query": "",
+            "sort_by": "",
+            "sort_order": "",
+            "result_count": len(search_plan.queries) if search_plan is not None else None,
+            "search_plan_text": self._format_search_plan_for_display(search_plan) if search_plan is not None else "",
+            "search_plan": search_plan.to_dict() if search_plan is not None else None,
+            "planned_by_model": search_plan.planned_by_model if search_plan is not None else None,
+            "error": error,
+        }
+
+    def _format_search_plan_for_display(self, search_plan: ExternalSearchPlan | None) -> str:
+        """把 LLM 返回的检索计划压缩成准备区可读的多行文本。"""
+        if search_plan is None or not search_plan.queries:
+            return "暂无检索计划"
+
+        parts: list[str] = []
+        for index, query_plan in enumerate(search_plan.queries, start=1):
+            keywords = " + ".join(query_plan.query) if query_plan.query else "未命名查询"
+            sources = ", ".join(query_plan.sources or ["arxiv", "openalex"])
+            date_text = f"，date_from={query_plan.date_from}" if query_plan.date_from else ""
+            parts.append(
+                f"{index}. [{sources}] {keywords}{date_text}，"
+                f"sort={query_plan.sortby}/{query_plan.orderby}，limit={query_plan.limit}"
+            )
+        return "\n".join(parts)
 
     def _count_unique_documents(self, documents: list[dict[str, Any]]) -> int:
         """统计检索结果中去重后的文献数量。"""
@@ -791,26 +886,13 @@ class AgentOrchestratorService:
         freshness_requested: bool = False,
     ) -> ExternalSearchPlan:
         """构造外部检索计划；有 planner 时优先让模型提取 MCP 参数。"""
-        if self.external_search_planner_service is not None:
-            return self.external_search_planner_service.plan(
-                query,
-                default_limit=limit,
-                freshness_requested=freshness_requested,
-            )
-        return ExternalSearchPlan(
-            queries=[
-                ExternalSearchQueryPlan(
-                    query=self._build_fallback_external_keywords(query),
-                    limit=min(max(limit, 1), config.MAX_EXTERNAL_QUERY_LIMIT),
-                    date_from="20240101" if freshness_requested else None,
-                    sortby="submittedDate" if freshness_requested else "relevance",
-                    orderby="descending",
-                    sources=["arxiv", "openalex"],
-                )
-            ],
-            final_limit=config.DEFAULT_EXTERNAL_FINAL_LIMIT,
-            rationale="Fallback search plan.",
-            planned_by_model=False,
+        if self.external_search_planner_service is None:
+            raise RuntimeError("外部检索计划服务未初始化，无法生成检索计划。")
+
+        return self.external_search_planner_service.plan(
+            query,
+            default_limit=limit,
+            freshness_requested=freshness_requested,
         )
 
     def _build_fallback_external_keywords(self, query: str) -> list[str]:

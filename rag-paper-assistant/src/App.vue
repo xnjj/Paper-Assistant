@@ -164,7 +164,13 @@ interface MessagePreparationStep {
   sortOrder: string
   requestUrl: string
   resultCount?: number
+  coverageSufficient?: boolean | null
+  coverageRationale?: string
+  searchPlanText?: string
+  searchPlan?: unknown
+  plannedByModel?: boolean | null
   error?: string
+  errorKind?: string
 }
 
 interface MessagePreparation {
@@ -173,6 +179,50 @@ interface MessagePreparation {
   startedAt: number
   elapsedSeconds: number | null
   steps: MessagePreparationStep[]
+}
+
+interface AgentTraceSpan {
+  spanId: string
+  name: string
+  type: string
+  status: string
+  elapsedMs: number | null
+  input: Record<string, unknown>
+  output: Record<string, unknown>
+  metrics: Record<string, unknown>
+  error: string
+}
+
+interface TraceDetailDocument {
+  document_id?: number | string | null
+  source_id?: string
+  source_type?: string
+  title?: string
+  authors?: string[]
+  year?: string
+  venue?: string
+  doi?: string
+  url?: string
+  file_path?: string
+  chunk_index?: number | null
+  rerank_score?: number | string | null
+  abstract?: string
+  chunk_text?: string
+}
+
+interface TraceDetailDocumentGroup {
+  groupKey: string
+  document: TraceDetailDocument
+  chunks: TraceDetailDocument[]
+}
+
+interface AgentTrace {
+  traceId: string
+  status: string
+  startedAt: string
+  finishedAt: string | null
+  elapsedMs: number | null
+  spans: AgentTraceSpan[]
 }
 
 interface PersistedPreparationStep {
@@ -184,7 +234,13 @@ interface PersistedPreparationStep {
   sort_order?: string
   request_url?: string
   result_count?: number
+  coverage_sufficient?: boolean | null
+  coverage_rationale?: string
+  search_plan_text?: string
+  search_plan?: unknown
+  planned_by_model?: boolean | null
   error?: string
+  error_kind?: string
 }
 
 interface PersistedPreparation {
@@ -203,6 +259,7 @@ interface UiMessage {
   retrievedMemories: RetrievedMemory[]
   citations: CitationBinding[]
   preparation?: MessagePreparation
+  agentTrace?: AgentTrace
 }
 
 interface ReferenceEntry {
@@ -333,6 +390,7 @@ interface StreamDoneEvent {
   type: 'done'
   answer: string
   citations?: CitationBinding[]
+  agent_trace?: unknown
 }
 
 interface StreamErrorEvent {
@@ -353,7 +411,13 @@ interface StreamPrepareStepPayload {
   sort_order: string
   request_url?: string
   result_count?: number
+  coverage_sufficient?: boolean | null
+  coverage_rationale?: string
+  search_plan_text?: string
+  search_plan?: unknown
+  planned_by_model?: boolean | null
   error?: string
+  error_kind?: string
 }
 
 interface StreamPrepareStepEvent {
@@ -418,6 +482,7 @@ const configuredFolderPath = ref('')
 const configuredFolderPdfCount = ref<number | null>(null)
 const activeReferenceKey = ref<string | null>(null)
 const expandedReferenceKeys = ref<Record<string, boolean>>({})
+const traceDetailSpan = ref<AgentTraceSpan | null>(null)
 
 const statusMessage = ref('')
 const statusMessageIsError = ref(false)
@@ -1418,6 +1483,33 @@ function usePrompt(prompt: PromptTemplateCard | string) {
   inputValue.value = typeof prompt === 'string' ? prompt : prompt.template
 }
 
+// 判断失败时是否应保留当前助手消息，避免准备区进度被错误清空。
+function hasVisibleAssistantFailureState(message: UiMessage) {
+  return Boolean(message.content.trim() || message.preparation)
+}
+
+// 将流式流程失败原因写入当前助手气泡，并保留已经完成的准备区步骤。
+function markAssistantMessageFailed(message: UiMessage, error: string) {
+  const preparation = ensureMessagePreparation(message)
+  preparation.status = 'done'
+  preparation.elapsedSeconds = Math.max(0, (Date.now() - preparation.startedAt) / 1000)
+  if (!preparation.steps.some((step) => step.status === 'error')) {
+    preparation.steps.push({
+      id: 'stream-error',
+      status: 'error',
+      source: 'system',
+      query: '',
+      sortBy: '',
+      sortOrder: '',
+      requestUrl: '',
+      error,
+    })
+  }
+  if (!message.content.trim()) {
+    message.content = `流程已终止`
+  }
+}
+
 async function sendMessage() {
   const text = inputValue.value.trim()
   if (!text || isSending.value) {
@@ -1473,10 +1565,15 @@ async function sendMessage() {
     }
     await refreshSessions()
   } catch (error) {
-    messages.value = messages.value.filter(
-      (item) => item.id !== optimisticUserMessage.id && item.id !== streamingAssistantMessage.id,
-    )
-    errorMessage.value = extractErrorMessage(error, '发送消息失败。')
+    const message = extractErrorMessage(error, '发送消息失败。')
+    if (reactiveAssistantMessage && hasVisibleAssistantFailureState(reactiveAssistantMessage)) {
+      markAssistantMessageFailed(reactiveAssistantMessage, message)
+    } else {
+      messages.value = messages.value.filter(
+        (item) => item.id !== optimisticUserMessage.id && item.id !== streamingAssistantMessage.id,
+      )
+    }
+    errorMessage.value = message
   } finally {
     isSending.value = false
     followMessageStreamToBottom.value = false
@@ -1717,6 +1814,7 @@ async function applyStreamEvent(event: StreamEvent, assistantMessage: UiMessage)
   if (event.type === 'done') {
     assistantMessage.content = event.answer ?? assistantMessage.content
     assistantMessage.citations = event.citations ?? []
+    assistantMessage.agentTrace = mapPersistedAgentTrace(event.agent_trace)
     stopPreparationTimer()
     await flushStreamFrame()
     return
@@ -1724,7 +1822,10 @@ async function applyStreamEvent(event: StreamEvent, assistantMessage: UiMessage)
 
   if (event.type === 'error') {
     stopPreparationTimer()
-    throw new Error(event.message || '流式输出失败')
+    const message = event.message || '流式输出失败'
+    markAssistantMessageFailed(assistantMessage, message)
+    await flushStreamFrame()
+    throw new Error(message)
   }
 }
 
@@ -1771,7 +1872,13 @@ function mapPreparationStep(step: StreamPrepareStepPayload): MessagePreparationS
     sortOrder: step.sort_order || 'descending',
     requestUrl: step.request_url || '',
     resultCount: step.result_count,
+    coverageSufficient: step.coverage_sufficient ?? null,
+    coverageRationale: step.coverage_rationale || '',
+    searchPlanText: step.search_plan_text || '',
+    searchPlan: step.search_plan,
+    plannedByModel: step.planned_by_model ?? null,
     error: step.error || '',
+    errorKind: step.error_kind || '',
   }
 }
 
@@ -1808,8 +1915,66 @@ function mapPersistedPreparationStep(step: PersistedPreparationStep): MessagePre
     sortOrder: step.sort_order || 'descending',
     requestUrl: step.request_url || '',
     resultCount: step.result_count,
+    coverageSufficient: step.coverage_sufficient ?? null,
+    coverageRationale: step.coverage_rationale || '',
+    searchPlanText: step.search_plan_text || '',
+    searchPlan: step.search_plan,
+    plannedByModel: step.planned_by_model ?? null,
     error: step.error || '',
+    errorKind: step.error_kind || '',
   }
+}
+
+// 将后端持久化的 agent_trace 映射为前端展示结构，兼容字段缺失的历史消息。
+function mapPersistedAgentTrace(payload: unknown): AgentTrace | undefined {
+  if (!payload || typeof payload !== 'object') {
+    return undefined
+  }
+
+  const tracePayload = payload as Record<string, unknown>
+  const spans = Array.isArray(tracePayload.spans)
+    ? tracePayload.spans.map(mapPersistedAgentTraceSpan).filter((span): span is AgentTraceSpan => Boolean(span))
+    : []
+
+  return {
+    traceId: String(tracePayload.trace_id || ''),
+    status: String(tracePayload.status || 'success'),
+    startedAt: String(tracePayload.started_at || ''),
+    finishedAt: tracePayload.finished_at ? String(tracePayload.finished_at) : null,
+    elapsedMs: normalizeNullableNumber(tracePayload.elapsed_ms),
+    spans,
+  }
+}
+
+// 将单个 trace span 映射为前端统一结构，避免模板中直接处理 snake_case。
+function mapPersistedAgentTraceSpan(payload: unknown): AgentTraceSpan | undefined {
+  if (!payload || typeof payload !== 'object') {
+    return undefined
+  }
+
+  const spanPayload = payload as Record<string, unknown>
+  return {
+    spanId: String(spanPayload.span_id || spanPayload.name || ''),
+    name: String(spanPayload.name || 'agent_step'),
+    type: String(spanPayload.type || 'orchestrator'),
+    status: String(spanPayload.status || 'success'),
+    elapsedMs: normalizeNullableNumber(spanPayload.elapsed_ms),
+    input: normalizeRecord(spanPayload.input),
+    output: normalizeRecord(spanPayload.output),
+    metrics: normalizeRecord(spanPayload.metrics),
+    error: String(spanPayload.error || ''),
+  }
+}
+
+// 规范化可为空数字字段，防止 NaN 泄漏到 UI。
+function normalizeNullableNumber(value: unknown) {
+  const parsed = Number(value)
+  return Number.isFinite(parsed) ? parsed : null
+}
+
+// 规范化对象字段，trace 的 input/output/metrics 都以普通对象展示。
+function normalizeRecord(value: unknown): Record<string, unknown> {
+  return value && typeof value === 'object' && !Array.isArray(value) ? (value as Record<string, unknown>) : {}
 }
 
 function normalizePreparationStepStatus(status: PreparationStepStatus | undefined): PreparationStepStatus {
@@ -1852,6 +2017,31 @@ function formatElapsedSeconds(value: number) {
 }
 
 function formatPreparationStep(step: MessagePreparationStep) {
+  if (step.source === 'coverage') {
+    if (step.status === 'error') {
+      return `本地文献充分性判断失败：${step.error || '未知错误'}`
+    }
+    if (step.status !== 'success') {
+      return '正在判断本地文献充分性...'
+    }
+
+    const resultText =
+      step.coverageSufficient === true ? '充分' : step.coverageSufficient === false ? '不足' : '未知'
+    const rationale = step.coverageRationale?.trim() || '暂无理由'
+    return `对本地文献充分性判断结果：${resultText}\n理由：${rationale}`
+  }
+
+  if (step.source === 'search_plan') {
+    if (step.status === 'error') {
+      return `外部检索计划生成失败：${step.error || '未知错误'}`
+    }
+    if (step.status !== 'success') {
+      return '正在生成外部检索计划...'
+    }
+
+    return `外部检索：\n${step.searchPlanText?.trim() || '暂无检索计划'}`
+  }
+
   if (step.source === 'library') {
     const libraryName = step.query || '当前文献库'
     if (step.status === 'success') {
@@ -1868,13 +2058,281 @@ function formatPreparationStep(step: MessagePreparationStep) {
     return `${step.source}检索到${step.resultCount ?? 0}篇文献：${step.requestUrl || '暂无请求链接'}`
   }
   if (step.status === 'error') {
+    if (step.errorKind === 'rate_limited') {
+      return `${step.source}请求被限流：${step.requestUrl || step.error || '暂无请求链接'}`
+    }
     return `${step.source} 检索失败：${step.error || '未知错误'}`
   }
   return `正在检索 ${step.source}：${step.query || '未命名查询'}；排序方式：${sortText}`
 }
 
 function hasPreparationRequestUrl(step: MessagePreparationStep) {
-  return step.source !== 'library' && step.status === 'success' && step.requestUrl.trim().length > 0
+  return (
+    step.source !== 'library' &&
+    step.source !== 'coverage' &&
+    step.source !== 'search_plan' &&
+    (step.status === 'success' || (step.status === 'error' && step.errorKind === 'rate_limited')) &&
+    step.requestUrl.trim().length > 0
+  )
+}
+
+// 为带请求链接的准备区步骤生成前缀文案，区分成功无结果和请求限流。
+function formatPreparationRequestLabel(step: MessagePreparationStep) {
+  if (step.status === 'error' && step.errorKind === 'rate_limited') {
+    return `${step.source}请求被限流：`
+  }
+  return `${step.source}检索到${step.resultCount ?? 0}篇文献：`
+}
+
+// 判断当前消息是否有可展示的 Agent trace。
+function hasAgentTrace(message: UiMessage) {
+  return getDisplayTraceSpans(message).length > 0
+}
+
+// 过滤不再作为工具链主路径展示的历史汇总节点。
+function getDisplayTraceSpans(message: UiMessage) {
+  const hiddenNames = new Set(['context_preparation', 'local_search', 'external_search'])
+  return (message.agentTrace?.spans ?? []).filter((span) => !hiddenNames.has(span.name))
+}
+
+// 格式化 trace span 的标题，兼顾简洁展示和调试可读性。
+function formatTraceSpanTitle(span: AgentTraceSpan) {
+  return `${formatTraceSpanName(span.name)} · ${formatTraceSpanType(span.type)}`
+}
+
+// 将后端内部阶段名转换为中文展示名。
+function formatTraceSpanName(name: string) {
+  const labels: Record<string, string> = {
+    local_retrieval: '本地文献检索',
+    coverage_assessment: '证据充分性判断',
+    search_plan_generation: '生成检索计划',
+    evidence_merge: '证据合并',
+    prompt_build: '提示词构造',
+    answer_generation: '回答生成',
+    citation_binding: '引用绑定',
+  }
+  if (name.startsWith('external_search.')) {
+    return `外部检索 ${name.replace('external_search.', '')}`
+  }
+  return labels[name] || name
+}
+
+// 将 trace 类型转换成更适合展示的短标签。
+function formatTraceSpanType(type: string) {
+  const labels: Record<string, string> = {
+    llm: 'LLM',
+    mcp_tool: 'MCP',
+    retriever: 'Retriever',
+    merge: 'Merge',
+    prompt: 'Prompt',
+    citation: 'Citation',
+  }
+  return labels[type] || type
+}
+
+// 生成 trace span 的状态和耗时描述。
+function formatTraceSpanMeta(span: AgentTraceSpan) {
+  const statusText = span.status === 'success' ? '成功' : span.status === 'error' ? '失败' : span.status
+  const elapsedText = span.elapsedMs !== null ? `，${formatElapsedSeconds(span.elapsedMs / 1000)}秒` : ''
+  return `${statusText}${elapsedText}`
+}
+
+// 从 trace span 中提炼最有帮助的一行摘要，避免把完整 JSON 直接塞进界面。
+function formatTraceSpanSummary(span: AgentTraceSpan) {
+  if (span.error) {
+    return span.error
+  }
+
+  const resultCount = getTraceValue(span.output, 'result_count') ?? getTraceValue(span.metrics, 'result_count')
+  if (resultCount !== undefined) {
+    return `返回 ${resultCount} 条结果`
+  }
+
+  // const searchPlanText = getTraceValue(span.output, 'search_plan_text')
+  // if (searchPlanText !== undefined) {
+  //   return String(searchPlanText)
+  // }
+
+  const selectedCount = getTraceValue(span.output, 'selected_document_count')
+  if (selectedCount !== undefined) {
+    const localCount = getTraceValue(span.output, 'local_document_count') ?? 0
+    const externalCount = getTraceValue(span.output, 'external_document_count') ?? 0
+    return `最终选择 ${selectedCount} 条证据，本地 ${localCount} 条，外部 ${externalCount} 条`
+  }
+
+  const promptChars = getTraceValue(span.metrics, 'prompt_chars')
+  if (promptChars !== undefined) {
+    return `Prompt 长度 ${promptChars} 字符`
+  }
+
+  const answerChars = getTraceValue(span.output, 'answer_chars')
+  if (answerChars !== undefined) {
+    return `输出 ${answerChars} 字符`
+  }
+
+  const citationCount = getTraceValue(span.output, 'citation_count')
+  if (citationCount !== undefined) {
+    return `绑定 ${citationCount} 条引用`
+  }
+
+  const detail = getTraceValue(span.input, 'detail')
+  return detail !== undefined ? String(detail) : ''
+}
+
+// 从 trace 对象中读取字段，统一处理空字符串。
+function getTraceValue(record: Record<string, unknown>, key: string) {
+  const value = record[key]
+  if (value === null || value === undefined || value === '') {
+    return undefined
+  }
+  return value
+}
+
+// 判断工具链节点是否有详情可查看。
+function canOpenTraceSpanDetail(span: AgentTraceSpan) {
+  return (
+    span.name === 'local_retrieval' ||
+    span.name === 'evidence_merge' ||
+    span.name === 'prompt_build' ||
+    span.name.startsWith('external_search.')
+  )
+}
+
+// 打开工具链详情弹窗。
+function openTraceSpanDetail(span: AgentTraceSpan) {
+  traceDetailSpan.value = span
+}
+
+// 关闭工具链详情弹窗。
+function closeTraceDetailDialog() {
+  traceDetailSpan.value = null
+}
+
+// 生成工具链详情弹窗标题。
+function formatTraceDetailTitle(span: AgentTraceSpan | null) {
+  return span ? `${formatTraceSpanName(span.name)}详情` : '工具链详情'
+}
+
+// 从 trace span 中读取精简文献列表。
+function getTraceDetailDocuments(span: AgentTraceSpan | null): TraceDetailDocument[] {
+  if (!span) {
+    return []
+  }
+  const documents = span.output.documents
+  if (!Array.isArray(documents)) {
+    return []
+  }
+  return documents
+    .filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === 'object')
+    .map((item) => ({
+      document_id: item.document_id === null || item.document_id === undefined ? null : String(item.document_id),
+      source_id: String(item.source_id || ''),
+      source_type: String(item.source_type || ''),
+      title: String(item.title || ''),
+      authors: Array.isArray(item.authors) ? item.authors.map((author) => String(author)) : [],
+      year: String(item.year || ''),
+      venue: String(item.venue || ''),
+      doi: String(item.doi || ''),
+      url: String(item.url || ''),
+      file_path: String(item.file_path || ''),
+      chunk_index: item.chunk_index === null || item.chunk_index === undefined ? null : Number(item.chunk_index),
+      rerank_score: item.rerank_score === null || item.rerank_score === undefined ? null : String(item.rerank_score),
+      abstract: String(item.abstract || ''),
+      chunk_text: String(item.chunk_text || ''),
+    }))
+}
+
+// 判断工具链详情是否需要按同一篇文献聚合多个分块。
+function shouldGroupTraceDocumentsByPaper(span: AgentTraceSpan | null) {
+  return span?.name === 'local_retrieval'
+}
+
+// 把本地检索详情按文献聚合，其他详情仍按单条记录展示。
+function getTraceDetailDocumentGroups(span: AgentTraceSpan | null): TraceDetailDocumentGroup[] {
+  const documents = getTraceDetailDocuments(span)
+  if (!shouldGroupTraceDocumentsByPaper(span)) {
+    return documents.map((document, index) => ({
+      groupKey: buildTraceDocumentGroupKey(document, index),
+      document,
+      chunks: [document],
+    }))
+  }
+
+  const groups = new Map<string, TraceDetailDocumentGroup>()
+  documents.forEach((document, index) => {
+    const groupKey = buildTraceDocumentGroupKey(document, index)
+    const existingGroup = groups.get(groupKey)
+    if (existingGroup) {
+      existingGroup.chunks.push(document)
+      return
+    }
+    groups.set(groupKey, {
+      groupKey,
+      document,
+      chunks: [document],
+    })
+  })
+  return [...groups.values()]
+}
+
+// 为同一篇文献构造稳定分组键，优先使用 document_id。
+function buildTraceDocumentGroupKey(document: TraceDetailDocument, index: number) {
+  if (document.document_id !== null && document.document_id !== undefined && document.document_id !== '') {
+    return `document:${document.document_id}`
+  }
+  if (document.source_id) {
+    return `source:${document.source_id}`
+  }
+  if (document.file_path) {
+    return `file:${document.file_path}`
+  }
+  return `title:${document.title || 'unknown'}:${index}`
+}
+
+// 格式化详情弹窗的记录数量说明。
+function formatTraceDetailRecordCount(span: AgentTraceSpan | null) {
+  const documents = getTraceDetailDocuments(span)
+  if (shouldGroupTraceDocumentsByPaper(span)) {
+    return `共 ${getTraceDetailDocumentGroups(span).length} 篇文献，${documents.length} 个分块。`
+  }
+  return `共 ${documents.length} 条记录。`
+}
+
+// 从 Prompt 构造节点中读取省略版 Prompt。
+function getTracePromptPreview(span: AgentTraceSpan | null) {
+  if (!span || span.name !== 'prompt_build') {
+    return ''
+  }
+  return String(span.output.prompt_preview || '')
+}
+
+// 格式化工具链详情文献的作者行。
+function formatTraceDocumentAuthors(document: TraceDetailDocument) {
+  return document.authors?.length ? document.authors.join(', ') : '作者未知'
+}
+
+// 格式化工具链详情文献的基础元数据。
+function formatTraceDocumentMeta(document: TraceDetailDocument) {
+  return [document.year, document.venue, document.source_id].filter(Boolean).join(' · ') || '暂无元数据'
+}
+
+// 格式化工具链详情文献的重排分数。
+function formatTraceDocumentScore(document: TraceDetailDocument) {
+  if (document.rerank_score === null || document.rerank_score === undefined || document.rerank_score === '') {
+    return ''
+  }
+  const score = Number(document.rerank_score)
+  return Number.isFinite(score) ? `重排分数：${score.toFixed(4)}` : `重排分数：${document.rerank_score}`
+}
+
+// 格式化同一篇文献下的分块标题。
+function formatTraceChunkTitle(chunk: TraceDetailDocument, index: number) {
+  const chunkIndex = typeof chunk.chunk_index === 'number' && Number.isFinite(chunk.chunk_index)
+    ? chunk.chunk_index
+    : null
+  const chunkLabel = chunkIndex === null ? `分块 ${index + 1}` : `分块 ${chunkIndex}`
+  const scoreLabel = formatTraceDocumentScore(chunk)
+  return scoreLabel ? `${chunkLabel} · ${scoreLabel}` : chunkLabel
 }
 
 async function flushStreamFrame() {
@@ -2153,6 +2611,7 @@ function mapMessageFromApi(message: SessionMessage): UiMessage {
   let retrievedMemories: RetrievedMemory[] = []
   let citations: CitationBinding[] = []
   let preparation: MessagePreparation | undefined
+  let agentTrace: AgentTrace | undefined
 
   if (message.retrieval_context_json) {
     try {
@@ -2161,16 +2620,28 @@ function mapMessageFromApi(message: SessionMessage): UiMessage {
         memories?: RetrievedMemory[]
         citations?: CitationBinding[]
         preparation?: unknown
+        agent_trace?: unknown
       }
       retrievedDocuments = context.documents ?? []
       retrievedMemories = context.memories ?? []
       citations = context.citations ?? []
       preparation = mapPersistedPreparation(context.preparation)
+      agentTrace = mapPersistedAgentTrace(context.agent_trace)
+      if (!preparation && agentTrace) {
+        preparation = {
+          status: 'done',
+          expanded: false,
+          startedAt: Date.now() - Math.max(0, agentTrace.elapsedMs ?? 0),
+          elapsedSeconds: agentTrace.elapsedMs !== null ? agentTrace.elapsedMs / 1000 : null,
+          steps: [],
+        }
+      }
     } catch {
       retrievedDocuments = []
       retrievedMemories = []
       citations = []
       preparation = undefined
+      agentTrace = undefined
     }
   }
 
@@ -2184,6 +2655,7 @@ function mapMessageFromApi(message: SessionMessage): UiMessage {
     retrievedMemories,
     citations,
     preparation,
+    agentTrace,
   }
 }
 
@@ -2869,7 +3341,7 @@ function isReferenceExpanded(messageId: number, referenceNumber: number) {
                   >
                     <span class="preparation-step__dot" />
                     <span v-if="hasPreparationRequestUrl(step)" class="preparation-step__text">
-                      {{ step.source }}检索到{{ step.resultCount ?? 0 }}篇文献：
+                      {{ formatPreparationRequestLabel(step) }}
                       <a
                         class="preparation-step__link"
                         :href="step.requestUrl"
@@ -2880,6 +3352,41 @@ function isReferenceExpanded(messageId: number, referenceNumber: number) {
                       </a>
                     </span>
                     <span v-else class="preparation-step__text">{{ formatPreparationStep(step) }}</span>
+                  </div>
+                  <div v-if="hasAgentTrace(message)" class="agent-trace-panel">
+                    <div class="agent-trace-panel__title">
+                      工具链 Trace
+                      <span v-if="message.agentTrace?.elapsedMs !== null">
+                        · {{ formatElapsedSeconds((message.agentTrace?.elapsedMs ?? 0) / 1000) }} 秒
+                      </span>
+                    </div>
+                    <div
+                      v-for="span in getDisplayTraceSpans(message)"
+                      :key="span.spanId"
+                      class="agent-trace-span"
+                      :class="`agent-trace-span--${span.status}`"
+                    >
+                      <span class="agent-trace-span__dot" />
+                      <div class="agent-trace-span__body">
+                        <div class="agent-trace-span__head">
+                          <strong>{{ formatTraceSpanTitle(span) }}</strong>
+                          <span>{{ formatTraceSpanMeta(span) }}</span>
+                          <button
+                            v-if="canOpenTraceSpanDetail(span)"
+                            class="agent-trace-detail-button"
+                            type="button"
+                            aria-label="查看工具链详情"
+                            title="查看工具链详情"
+                            @click.stop="openTraceSpanDetail(span)"
+                          >
+                            🔍
+                          </button>
+                        </div>
+                        <p v-if="formatTraceSpanSummary(span)">
+                          {{ formatTraceSpanSummary(span) }}
+                        </p>
+                      </div>
+                    </div>
                   </div>
                 </div>
               </div>
@@ -3239,6 +3746,67 @@ function isReferenceExpanded(messageId: number, referenceNumber: number) {
       </div>
     </div>
   </div>
+  <div v-if="traceDetailSpan !== null" class="dialog-mask dialog-mask--top" @click.self="closeTraceDetailDialog()">
+    <div class="dialog-card trace-detail-dialog">
+      <div class="dialog-card__header">
+        <h3>{{ formatTraceDetailTitle(traceDetailSpan) }}</h3>
+        <button class="dialog-card__close" type="button" aria-label="关闭" @click="closeTraceDetailDialog()">×</button>
+      </div>
+      <div class="trace-detail-dialog__body">
+        <template v-if="traceDetailSpan.name === 'prompt_build'">
+          <p class="trace-detail-dialog__hint">
+            下方 Prompt 已用“...”省略与“证据合并”重复的候选文献证据段。
+          </p>
+          <pre class="trace-detail-dialog__prompt">{{ getTracePromptPreview(traceDetailSpan) || '暂无可展示的 Prompt。' }}</pre>
+        </template>
+        <template v-else>
+          <p class="trace-detail-dialog__hint">
+            {{ formatTraceDetailRecordCount(traceDetailSpan) }}
+          </p>
+          <div v-if="getTraceDetailDocumentGroups(traceDetailSpan).length" class="trace-detail-document-list">
+            <article
+              v-for="(group, index) in getTraceDetailDocumentGroups(traceDetailSpan)"
+              :key="group.groupKey"
+              class="trace-detail-document"
+            >
+              <div class="trace-detail-document__header">
+                <strong>{{ index + 1 }}. {{ group.document.title || '未命名文献' }}</strong>
+                <span v-if="!shouldGroupTraceDocumentsByPaper(traceDetailSpan) && formatTraceDocumentScore(group.document)">
+                  {{ formatTraceDocumentScore(group.document) }}
+                </span>
+              </div>
+              <p class="trace-detail-document__meta">{{ formatTraceDocumentMeta(group.document) }}</p>
+              <p class="trace-detail-document__meta">{{ formatTraceDocumentAuthors(group.document) }}</p>
+              <p v-if="group.document.doi" class="trace-detail-document__meta">DOI：{{ group.document.doi }}</p>
+              <p v-if="group.document.url" class="trace-detail-document__meta">
+                URL：
+                <a :href="group.document.url" target="_blank" rel="noreferrer">{{ group.document.url }}</a>
+              </p>
+              <p v-if="group.document.file_path" class="trace-detail-document__path">{{ group.document.file_path }}</p>
+              <p v-if="group.document.abstract" class="trace-detail-document__text">{{ group.document.abstract }}</p>
+              <div
+                v-if="shouldGroupTraceDocumentsByPaper(traceDetailSpan) && group.chunks.length"
+                class="trace-detail-chunk-list"
+              >
+                <div
+                  v-for="(chunk, chunkIndex) in group.chunks"
+                  :key="`${group.groupKey}-${chunk.chunk_index ?? chunkIndex}`"
+                  class="trace-detail-chunk"
+                >
+                  <div class="trace-detail-chunk__header">{{ formatTraceChunkTitle(chunk, chunkIndex) }}</div>
+                  <p v-if="chunk.chunk_text" class="trace-detail-document__snippet">{{ chunk.chunk_text }}</p>
+                </div>
+              </div>
+              <p v-else-if="group.document.chunk_text" class="trace-detail-document__snippet">
+                {{ group.document.chunk_text }}
+              </p>
+            </article>
+          </div>
+          <p v-else class="trace-detail-dialog__empty">暂无可展示的文献详情。</p>
+        </template>
+      </div>
+    </div>
+  </div>
   <div v-if="libraryPanelOpen" class="dialog-mask" @click.self="closeLibraryPanel">
     <div class="dialog-card library-panel">
       <div class="dialog-card__header">
@@ -3339,7 +3907,7 @@ function isReferenceExpanded(messageId: number, referenceNumber: number) {
         </div>
         <div class="library-panel__create">
           <label class="library-panel__field" :class="{ 'library-panel__field--error': !!newLibraryFieldErrors.name }">
-            <span>文献库名称</span>
+            <span>文献库名称 <span style="color: #dc2626;">*</span></span>
             <input
               v-model="newLibraryName"
               type="text"
@@ -3350,7 +3918,7 @@ function isReferenceExpanded(messageId: number, referenceNumber: number) {
             <small v-if="newLibraryFieldErrors.name" class="library-panel__field-error">{{ newLibraryFieldErrors.name }}</small>
           </label>
           <label class="library-panel__field" :class="{ 'library-panel__field--error': !!newLibraryFieldErrors.folderPath }">
-            <span>文献文件夹</span>
+            <span>文献文件夹 <span style="color: #dc2626;">*</span></span>
             <div class="library-panel__folder-picker">
               <input :value="newLibraryFolderPath || '暂未选择文件夹'" type="text" readonly />
               <button class="library-panel__action" type="button" @click="chooseFolderForNewLibrary">选择文件夹</button>
@@ -3364,7 +3932,7 @@ function isReferenceExpanded(messageId: number, referenceNumber: number) {
             </div>
             <div class="model-config-fields">
               <label class="library-panel__field" :class="{ 'library-panel__field--error': !!newLibraryFieldErrors.embeddingModel }">
-                <span>向量模型</span>
+                <span>向量模型 <span style="color: #dc2626;">*</span></span>
                 <input
                   v-model="newLibraryIndexConfig.embeddingModel"
                   type="text"
@@ -3375,7 +3943,7 @@ function isReferenceExpanded(messageId: number, referenceNumber: number) {
                 <small v-if="newLibraryFieldErrors.embeddingModel" class="library-panel__field-error">{{ newLibraryFieldErrors.embeddingModel }}</small>
               </label>
               <label class="library-panel__field" :class="{ 'library-panel__field--error': !!newLibraryFieldErrors.embeddingMaxInputTokens }">
-                <span>向量模型最大单次输入 Token 数</span>
+                <span>向量模型最大单次输入 Token 数 <span style="color: #dc2626;">*</span></span>
                 <input
                   v-model.number="newLibraryIndexConfig.embeddingMaxInputTokens"
                   type="number"
@@ -3387,7 +3955,7 @@ function isReferenceExpanded(messageId: number, referenceNumber: number) {
                 <small v-if="newLibraryFieldErrors.embeddingMaxInputTokens" class="library-panel__field-error">{{ newLibraryFieldErrors.embeddingMaxInputTokens }}</small>
               </label>
               <div class="library-panel__field model-config-field--full">
-                <span>分块模式</span>
+                <span>分块模式 <span style="color: #dc2626;">*</span></span>
                 <div class="model-config__chunk-toggle" :data-mode="newLibraryIndexConfig.chunkMode">
                   <span class="model-config__chunk-thumb" aria-hidden="true" />
                   <button
@@ -3407,9 +3975,6 @@ function isReferenceExpanded(messageId: number, referenceNumber: number) {
                     语义分块
                   </button>
                 </div>
-                <small class="model-config__hint">
-                  当前先完成建库页预设展示，后端文献库级索引参数将在下一步接入。
-                </small>
               </div>
             </div>
           </div>
@@ -3482,7 +4047,7 @@ function isReferenceExpanded(messageId: number, referenceNumber: number) {
 
             <div class="model-config-fields">
               <label class="library-panel__field" :class="{ 'library-panel__field--error': !!modelConfigFieldErrors.llmModel }">
-                <span>LLM</span>
+                <span>LLM <span style="color: #dc2626;">*</span></span>
                 <input
                   v-model="globalModelConfig.llmModel"
                   type="text"
@@ -3494,9 +4059,9 @@ function isReferenceExpanded(messageId: number, referenceNumber: number) {
               </label>
 
               <label class="library-panel__field" :class="{ 'library-panel__field--error': !!modelConfigFieldErrors.llmContextLength }">
-                <span>上下文长度</span>
+                <span>上下文长度 <span style="color: #dc2626;">*</span></span>
                 <small v-if="modelConfigFieldErrors.llmContextLength" class="library-panel__field-error">{{ modelConfigFieldErrors.llmContextLength }}</small>
-                <small class="model-config__hint">默认 200K，仅表示允许送入 LLM 的正文上下文上限。</small>
+                <!-- <small class="model-config__hint">表示允许送入 LLM 的正文上下文上限。</small> -->
                 <input
                   v-model.number="globalModelConfig.llmContextLength"
                   type="number"
@@ -3509,7 +4074,7 @@ function isReferenceExpanded(messageId: number, referenceNumber: number) {
               </label>
 
               <label class="library-panel__field model-config-field--full" :class="{ 'library-panel__field--error': !!modelConfigFieldErrors.apiKey }">
-                <span>API_KEY</span>
+                <span>API_KEY <span style="color: #dc2626;">*</span></span>
                 <input
                   v-model="globalModelConfig.apiKey"
                   type="password"
@@ -4358,8 +4923,11 @@ function isReferenceExpanded(messageId: number, referenceNumber: number) {
 }
 
 .preparation-step__text {
+  display: block;
   min-width: 0;
+  text-align: left;
   overflow-wrap: anywhere;
+  white-space: pre-wrap;
 }
 
 .preparation-step__link {
@@ -4393,6 +4961,218 @@ function isReferenceExpanded(messageId: number, referenceNumber: number) {
 
 .preparation-step--error .preparation-step__dot {
   background: #dc2626;
+}
+
+.agent-trace-panel {
+  display: grid;
+  gap: 0.5rem;
+  margin-top: 0.35rem;
+  padding-top: 0.55rem;
+  border-top: 1px solid rgba(148, 163, 184, 0.18);
+}
+
+.agent-trace-panel__title {
+  color: #475569;
+  font-size: 0.82rem;
+  font-weight: 700;
+}
+
+.agent-trace-span {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.5rem;
+  padding: 0.48rem 0.6rem;
+  border-radius: 12px;
+  background: rgba(248, 250, 252, 0.62);
+}
+
+.agent-trace-span__dot {
+  width: 0.42rem;
+  height: 0.42rem;
+  flex-shrink: 0;
+  margin-top: 0.46rem;
+  border-radius: 999px;
+  background: #94a3b8;
+}
+
+.agent-trace-span--success .agent-trace-span__dot {
+  background: #16a34a;
+}
+
+.agent-trace-span--error .agent-trace-span__dot {
+  background: #dc2626;
+}
+
+.agent-trace-span--running .agent-trace-span__dot {
+  background: #2563eb;
+}
+
+.agent-trace-span__body {
+  display: grid;
+  gap: 0.18rem;
+  min-width: 0;
+}
+
+.agent-trace-span__head {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem 0.55rem;
+  align-items: baseline;
+}
+
+.agent-trace-span__head strong {
+  color: #334155;
+  font-size: 0.86rem;
+}
+
+.agent-trace-span__head span,
+.agent-trace-span__body p {
+  margin: 0;
+  color: #64748b;
+  font-size: 0.82rem;
+  line-height: 1.55;
+  overflow-wrap: anywhere;
+}
+
+.agent-trace-detail-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.55rem;
+  height: 1.55rem;
+  padding: 0;
+  border: none;
+  border-radius: 999px;
+  background: rgba(37, 99, 235, 0.08);
+  color: #1d4ed8;
+  cursor: pointer;
+  font: inherit;
+  line-height: 1;
+}
+
+.agent-trace-detail-button:hover {
+  background: rgba(37, 99, 235, 0.16);
+}
+
+.trace-detail-dialog {
+  width: min(920px, calc(100vw - 2rem));
+  max-height: min(84vh, 900px);
+  overflow: hidden;
+}
+
+.trace-detail-dialog__body {
+  display: grid;
+  gap: 0.9rem;
+  max-height: calc(min(84vh, 900px) - 5.5rem);
+  overflow: auto;
+  padding-right: 0.15rem;
+}
+
+.trace-detail-dialog__hint,
+.trace-detail-dialog__empty {
+  margin: 0;
+  color: #64748b;
+  line-height: 1.65;
+}
+
+.trace-detail-dialog__prompt {
+  margin: 0;
+  padding: 1rem;
+  border-radius: 16px;
+  background: rgba(15, 23, 42, 0.92);
+  color: #f8fafc;
+  font-family: 'Cascadia Code', 'Consolas', monospace;
+  font-size: 0.86rem;
+  line-height: 1.7;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.trace-detail-document-list {
+  display: grid;
+  gap: 0.75rem;
+}
+
+.trace-detail-document {
+  display: grid;
+  gap: 0.45rem;
+  padding: 0.95rem 1rem;
+  border: 1px solid rgba(148, 163, 184, 0.18);
+  border-radius: 16px;
+  background: rgba(248, 250, 252, 0.86);
+}
+
+.trace-detail-document__header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 0.85rem;
+}
+
+.trace-detail-document__header strong {
+  color: #0f172a;
+  line-height: 1.5;
+}
+
+.trace-detail-document__header span {
+  flex-shrink: 0;
+  color: #2563eb;
+  font-size: 0.82rem;
+}
+
+.trace-detail-document__meta,
+.trace-detail-document__path,
+.trace-detail-document__text,
+.trace-detail-document__snippet {
+  margin: 0;
+  color: #475569;
+  line-height: 1.65;
+  overflow-wrap: anywhere;
+}
+
+.trace-detail-document__meta {
+  font-size: 0.88rem;
+}
+
+.trace-detail-document__meta a {
+  color: #2563eb;
+  text-decoration: underline;
+  text-underline-offset: 0.16em;
+}
+
+.trace-detail-document__path {
+  color: #64748b;
+  font-size: 0.84rem;
+}
+
+.trace-detail-document__text,
+.trace-detail-document__snippet {
+  color: #334155;
+  font-size: 0.9rem;
+}
+
+.trace-detail-document__snippet {
+  padding: 0.72rem 0.8rem;
+  border-radius: 12px;
+  background: rgba(15, 23, 42, 0.04);
+}
+
+.trace-detail-chunk-list {
+  display: grid;
+  gap: 0.55rem;
+  margin-top: 0.15rem;
+}
+
+.trace-detail-chunk {
+  display: grid;
+  gap: 0.35rem;
+}
+
+.trace-detail-chunk__header {
+  color: #2563eb;
+  font-size: 0.82rem;
+  font-weight: 600;
 }
 
 .message-bubble--user .message-bubble__content :deep(code) {

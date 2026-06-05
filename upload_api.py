@@ -396,7 +396,7 @@ def stream_chat_with_session(session_id: int, payload: ChatRequest) -> Streaming
             ):
                 yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
                 await asyncio.sleep(0.01)
-        except ValueError as exc:
+        except Exception as exc:
             error_event = {"type": "error", "message": str(exc)}
             yield f"data: {json.dumps(error_event, ensure_ascii=False)}\n\n"
 

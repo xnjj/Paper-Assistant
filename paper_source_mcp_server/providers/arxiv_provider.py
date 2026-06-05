@@ -20,7 +20,7 @@ class ArxivProvider(ExternalPaperProvider):
     api_base_url = "http://export.arxiv.org/api/query"
     _request_lock = threading.Lock()
     _last_request_at = 0.0
-    _min_request_interval_seconds = 3.2
+    _min_request_interval_seconds = 3.5
 
     def search(
         self,
@@ -92,7 +92,7 @@ class ArxivProvider(ExternalPaperProvider):
         """根据是否需要日期过滤，决定向 arXiv 额外多取多少结果。"""
         if date_from is None:
             return limit
-        return min(limit * 4, 20)
+        return min(limit, 20)
 
     def _filter_records_by_date(
         self,
@@ -172,7 +172,7 @@ class ArxivProvider(ExternalPaperProvider):
         return f"{self.api_base_url}?{urllib.parse.urlencode(params)}"
 
     def _fetch_feed(self, request_url: str) -> ET.Element:
-        """请求 arXiv API，并在 429 等临时错误时进行有限重试。"""
+        """请求 arXiv API；每个 query 只请求一次，不做内部重试。"""
         request = urllib.request.Request(
             request_url,
             headers={
@@ -180,37 +180,17 @@ class ArxivProvider(ExternalPaperProvider):
             },
         )
 
-        last_error: Exception | None = None
-        for attempt_index in range(3):
-            try:
-                self._wait_for_rate_limit_window()
-                with urllib.request.urlopen(request, timeout=30) as response:
-                    payload = response.read()
-                return ET.fromstring(payload)
-            except urllib.error.HTTPError as exc:
-                last_error = exc
-                if exc.code == 429 and attempt_index < 2:
-                    retry_after_seconds = self._parse_retry_after_seconds(exc)
-                    sleep_seconds = retry_after_seconds if retry_after_seconds is not None else (4 * (attempt_index + 1))
-                    time.sleep(sleep_seconds)
-                    continue
-                raise
-            except urllib.error.URLError as exc:
-                last_error = exc
-                if attempt_index < 2:
-                    time.sleep(2 * (attempt_index + 1))
-                    continue
-                raise
-            except (TimeoutError, socket.timeout, OSError) as exc:
-                last_error = exc
-                if attempt_index < 2:
-                    time.sleep(2 * (attempt_index + 1))
-                    continue
-                raise
-
-        if last_error is not None:
-            raise last_error
-        raise RuntimeError("arXiv API 请求失败，且未获得可用的异常信息。")
+        try:
+            self._wait_for_rate_limit_window()
+            with urllib.request.urlopen(request, timeout=30) as response:
+                payload = response.read()
+            return ET.fromstring(payload)
+        except urllib.error.HTTPError as exc:
+            raise RuntimeError(f"arXiv API 请求失败：HTTP Error {exc.code}: {exc.reason}") from exc
+        except urllib.error.URLError as exc:
+            raise RuntimeError(f"arXiv API 请求失败：{exc}") from exc
+        except (TimeoutError, socket.timeout, OSError) as exc:
+            raise RuntimeError(f"arXiv API 请求失败：{exc}") from exc
 
     def _wait_for_rate_limit_window(self) -> None:
         """在本进程内做基础请求间隔控制，降低触发 429 的概率。"""
@@ -221,17 +201,6 @@ class ArxivProvider(ExternalPaperProvider):
             if wait_seconds > 0:
                 time.sleep(wait_seconds)
             self._last_request_at = time.time()
-
-    def _parse_retry_after_seconds(self, exc: urllib.error.HTTPError) -> float | None:
-        """从 429 响应头读取 Retry-After 秒数；解析失败则返回 None。"""
-        try:
-            header_value = exc.headers.get("Retry-After") if exc.headers else None
-            if not header_value:
-                return None
-            seconds = float(str(header_value).strip())
-            return max(1.0, seconds)
-        except (TypeError, ValueError):
-            return None
 
     def _entry_to_record(self, entry: ET.Element) -> ExternalPaperRecord | None:
         """把单个 Atom entry 转换为统一论文记录。"""

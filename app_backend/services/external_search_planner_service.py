@@ -6,6 +6,8 @@ from dataclasses import asdict, dataclass
 from datetime import datetime
 from typing import Any
 
+from langchain_community.chat_models import ChatTongyi
+
 import config_data as config
 from app_backend.services.config_service import ConfigService
 
@@ -70,57 +72,42 @@ class ExternalSearchPlannerService:
         default_limit: int = DEFAULT_EXTERNAL_FINAL_LIMIT,
         freshness_requested: bool = False,
     ) -> ExternalSearchPlan:
-        """根据用户问题生成外部检索计划，失败时返回规则兜底计划。"""
+        """根据用户问题生成外部检索计划；LLM 失败时直接抛出异常，由上层终止流程。"""
         fallback_plan = self._build_fallback_plan(
             user_message,
             default_limit=default_limit,
             freshness_requested=freshness_requested,
         )
-        api_key = self._get_api_key()
-        if not api_key:
-            return fallback_plan
-
-        try:
-            response = self._build_openai_client(api_key).responses.create(
-                model=self._get_model_name(),
-                input=[
-                    {"role": "system", "content": self._build_system_prompt()},
-                    {"role": "user", "content": user_message},
-                ],
-                tools=self._build_function_tools(default_limit=default_limit),
-            )
-            function_call = self._extract_function_call(response)
-            if function_call is None:
-                return fallback_plan
-            _, raw_arguments = function_call
-            return self._normalize_plan(
-                raw_arguments,
-                fallback_plan=fallback_plan,
+        response = self._build_model().invoke(
+            self._build_planner_prompt(
+                user_message,
                 default_limit=default_limit,
+                freshness_requested=freshness_requested,
             )
-        except Exception as exc:
-            fallback_plan.rationale = f"{fallback_plan.rationale}; planner failed: {exc}"
-            return fallback_plan
+        )
+        raw_arguments = self._parse_plan_arguments(self._extract_model_text(response))
+        return self._normalize_plan(
+            raw_arguments,
+            fallback_plan=fallback_plan,
+            default_limit=default_limit,
+        )
 
-    def _build_openai_client(self, api_key: str) -> Any:
-        """延迟导入 OpenAI SDK，并按模型名称选择默认兼容端点。"""
-        from openai import OpenAI
-
-        base_url = os.getenv("OPENAI_BASE_URL")
-        model_name = self._get_model_name().lower()
-        if not base_url and model_name.startswith(("qwen", "qwq")):
-            base_url = "https://dashscope.aliyuncs.com/compatible-mode/v1"
-
-        if base_url:
-            return OpenAI(api_key=api_key, base_url=base_url)
-        return OpenAI(api_key=api_key)
+    def _build_model(self) -> ChatTongyi:
+        """根据当前运行时配置创建检索规划模型实例。"""
+        model_name = self._get_model_name()
+        api_key = self._get_api_key()
+        return ChatTongyi(
+            model=model_name,
+            api_key=api_key or None,
+            streaming=False,
+        )
 
     def _build_system_prompt(self) -> str:
         """构造检索规划提示词。"""
         current_year = datetime.now().year
         return (
             "你是外部学术检索代理。"
-            "当用户请求论文检索或研究现状时，必须调用 search_external_papers 工具生成检索计划。"
+            "当用户请求论文检索或研究现状时，必须生成可执行的外部检索计划。"
             f"当前年份是 {current_year}。"
             "对于“最近3年”这类时间条件，请换算 date_from，格式必须是 yyyymmdd。"
             f"请把复杂主题拆成最多 {MAX_PARALLEL_EXTERNAL_QUERIES} 组关键词。"
@@ -132,91 +119,95 @@ class ExternalSearchPlannerService:
             "例如 [\"DQN\", \"autonomous driving\"]。"
         )
 
-    def _build_function_tools(self, *, default_limit: int) -> list[dict[str, Any]]:
-        """定义让模型填充的批量 function tool schema。"""
-        return [
-            {
-                "type": "function",
-                "name": "search_external_papers",
-                "description": (
-                    "生成外部论文检索计划。请把复杂需求拆成多组关键词，"
-                    f"最多 {MAX_PARALLEL_EXTERNAL_QUERIES} 条，每条 limit 不超过 {MAX_EXTERNAL_QUERY_LIMIT}。"
-                ),
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "queries": {
-                            "type": "array",
-                            "minItems": 1,
-                            "maxItems": MAX_PARALLEL_EXTERNAL_QUERIES,
-                            "description": "需要并发执行的检索 query 列表。",
-                            "items": {
-                                "type": "object",
-                                "properties": {
-                                    "query": {
-                                        "type": "array",
-                                        "items": {"type": "string"},
-                                        "minItems": 1,
-                                        "maxItems": 4,
-                                        "description": (
-                                            "检索关键词或短语数组，最多 4 个。"
-                                            "不要包含 all:、AND、OR、cat: 等数据源语法。"
-                                            "例如 [\"edge computing\", \"LLM inference\"]。"
-                                        ),
-                                    },
-                                    "date_from": {
-                                        "type": "string",
-                                        "description": "日期下限，格式 yyyymmdd，例如 20240101。",
-                                    },
-                                    "sortby": {
-                                        "type": "string",
-                                        "enum": ["relevance", "submittedDate"],
-                                        "description": "排序字段。",
-                                    },
-                                    "orderby": {
-                                        "type": "string",
-                                        "enum": ["descending", "ascending"],
-                                        "description": "排序方向。",
-                                    },
-                                    "sources": {
-                                        "type": "array",
-                                        "items": {"type": "string"},
-                                        "description": "检索源列表，可使用 arxiv、openalex；默认两者都使用。",
-                                    },
-                                    "limit": {
-                                        "type": "integer",
-                                        "minimum": 1,
-                                        "maximum": MAX_EXTERNAL_QUERY_LIMIT,
-                                        "description": f"单条 query 返回论文数量，建议 {min(default_limit, MAX_EXTERNAL_QUERY_LIMIT)}。",
-                                    },
-                                },
-                                "required": ["query"],
-                            },
-                        },
-                        "rationale": {
-                            "type": "string",
-                            "description": "简要说明为什么这样拆分检索 query。",
-                        },
-                    },
-                    "required": ["queries"],
-                },
-            }
-        ]
+    def _build_planner_prompt(
+        self,
+        user_message: str,
+        *,
+        default_limit: int,
+        freshness_requested: bool,
+    ) -> str:
+        """构造让 ChatTongyi 直接输出 JSON 检索计划的完整提示词。"""
+        suggested_sortby = "submittedDate" if freshness_requested else "relevance"
+        suggested_limit = min(default_limit, MAX_EXTERNAL_QUERY_LIMIT)
+        return f"""
+{self._build_system_prompt()}
 
-    def _extract_function_call(self, response: Any) -> tuple[str, dict[str, Any]] | None:
-        """从 Responses API 返回值中提取 function_call 参数。"""
-        output_items = getattr(response, "output", None) or []
-        for item in output_items:
-            if getattr(item, "type", "") != "function_call":
-                continue
-            tool_name = getattr(item, "name", "")
-            raw_arguments = getattr(item, "arguments", "") or "{}"
+请只输出一个 JSON 对象，不要输出 Markdown，不要输出解释性前后缀。
+JSON 结构必须为：
+{{
+  "queries": [
+    {{
+      "query": ["英文关键词1", "英文关键词2"],
+      "date_from": "yyyymmdd 或空字符串",
+      "sortby": "relevance 或 submittedDate",
+      "orderby": "descending 或 ascending",
+      "sources": ["arxiv", "openalex"],
+      "limit": {suggested_limit}
+    }}
+  ],
+  "final_limit": {default_limit},
+  "rationale": "一句中文说明检索计划"
+}}
+
+约束：
+1. queries 最少 1 条，最多 {MAX_PARALLEL_EXTERNAL_QUERIES} 条。
+2. 每条 query 最多 4 个英文关键词或英文短语。
+3. limit 必须在 1 到 {MAX_EXTERNAL_QUERY_LIMIT} 之间。
+4. sources 如果用户没有指定，使用 ["arxiv", "openalex"]。
+5. sortby 默认使用 "{suggested_sortby}"，orderby 默认使用 "descending"。
+6. 不要把 queries、query 或 sources 编码成字符串，必须直接输出数组。
+
+用户问题：
+{user_message}
+""".strip()
+
+    def _extract_model_text(self, response: Any) -> str:
+        """从 ChatTongyi 响应中提取模型输出文本。"""
+        content = getattr(response, "content", response)
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts: list[str] = []
+            for item in content:
+                if isinstance(item, str):
+                    parts.append(item)
+                elif isinstance(item, dict) and item.get("text"):
+                    parts.append(str(item["text"]))
+            return "".join(parts)
+        return str(content) if content else ""
+
+    def _parse_plan_arguments(self, raw_text: str) -> dict[str, Any]:
+        """从模型自然语言响应中解析第一个 JSON 对象。"""
+        candidates = self._build_json_parse_candidates(raw_text)
+        for candidate in candidates:
             try:
-                arguments = json.loads(raw_arguments)
+                payload = json.loads(candidate)
             except json.JSONDecodeError:
-                return None
-            return tool_name, arguments
-        return None
+                continue
+            if isinstance(payload, dict):
+                return payload
+        raise ValueError("检索规划模型未返回可解析的 JSON 对象。")
+
+    def _build_json_parse_candidates(self, raw_text: str) -> list[str]:
+        """生成一组可能的 JSON 文本候选，兼容代码块和普通文本包裹。"""
+        text = (raw_text or "").strip()
+        candidates: list[str] = []
+        if not text:
+            return candidates
+
+        fenced_matches = re.findall(r"```(?:json)?\s*([\s\S]*?)```", text, flags=re.IGNORECASE)
+        candidates.extend(match.strip() for match in fenced_matches if match.strip())
+        candidates.append(text)
+
+        object_match = re.search(r"\{[\s\S]*\}", text)
+        if object_match:
+            candidates.append(object_match.group(0).strip())
+
+        deduped: list[str] = []
+        for candidate in candidates:
+            if candidate and candidate not in deduped:
+                deduped.append(candidate)
+        return deduped
 
     def _normalize_plan(
         self,
@@ -226,7 +217,8 @@ class ExternalSearchPlannerService:
         default_limit: int,
     ) -> ExternalSearchPlan:
         """校验模型生成的批量参数，非法字段回退到安全默认值。"""
-        raw_queries = arguments.get("queries")
+        arguments = self._coerce_json_object(arguments)
+        raw_queries = self._coerce_json_value(arguments.get("queries"))
         query_items: list[Any]
         if isinstance(raw_queries, list) and raw_queries:
             query_items = raw_queries
@@ -243,6 +235,7 @@ class ExternalSearchPlannerService:
         seen_query_keys: set[str] = set()
 
         for item in query_items:
+            item = self._coerce_json_value(item)
             if isinstance(item, str):
                 candidate = {**common_fields, "query": [item]}
             elif isinstance(item, dict):
@@ -267,7 +260,7 @@ class ExternalSearchPlannerService:
                 break
 
         if not query_plans:
-            return fallback_plan
+            raise ValueError("检索计划模型未生成可执行的 query。")
 
         return ExternalSearchPlan(
             queries=query_plans,
@@ -289,9 +282,8 @@ class ExternalSearchPlannerService:
         default_limit: int,
     ) -> ExternalSearchQueryPlan | None:
         """把单条 query 参数规范化为安全的检索子计划。"""
+        arguments = self._normalize_query_aliases(arguments)
         query = self._normalize_query_keywords(arguments.get("query"))
-        if not query:
-            query = fallback_query.query if fallback_query is not None else []
         if not query:
             return None
 
@@ -309,6 +301,7 @@ class ExternalSearchPlannerService:
             orderby = fallback_query.orderby if fallback_query else "descending"
 
         sources = arguments.get("sources")
+        sources = self._coerce_json_value(sources)
         if not isinstance(sources, list) or not sources:
             sources = fallback_query.sources if fallback_query is not None else ["arxiv", "openalex"]
         sources = self._normalize_sources(sources)
@@ -361,6 +354,7 @@ class ExternalSearchPlannerService:
 
     def _normalize_query_keywords(self, value: Any) -> list[str]:
         """规范化模型返回的关键词数组，兼容旧字符串输出并限制最多 4 个关键词。"""
+        value = self._coerce_json_value(value)
         if isinstance(value, list):
             raw_keywords = value
         else:
@@ -378,6 +372,37 @@ class ExternalSearchPlannerService:
             if len(keywords) >= 4:
                 break
         return keywords
+
+    def _coerce_json_object(self, value: Any) -> dict[str, Any]:
+        """把模型可能返回的 JSON 字符串参数安全转换为字典。"""
+        value = self._coerce_json_value(value)
+        return value if isinstance(value, dict) else {}
+
+    def _coerce_json_value(self, value: Any) -> Any:
+        """兼容模型把数组或对象字段二次编码成 JSON 字符串的情况。"""
+        if not isinstance(value, str):
+            return value
+
+        stripped = value.strip()
+        if not stripped or stripped[0] not in "[{":
+            return value
+
+        try:
+            return json.loads(stripped)
+        except json.JSONDecodeError:
+            return value
+
+    def _normalize_query_aliases(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        """兼容模型偶尔输出的字段别名，统一为内部检索计划字段。"""
+        normalized = dict(arguments)
+        if "query" not in normalized:
+            for alias in ("queries", "keywords", "search_terms", "search_query"):
+                if alias in normalized:
+                    normalized["query"] = normalized[alias]
+                    break
+        if "sources" not in normalized and "source" in normalized:
+            normalized["sources"] = normalized["source"]
+        return normalized
 
     def _build_fallback_keywords(self, user_message: str) -> list[str]:
         """模型规划不可用时，从用户问题中构造保守关键词。"""

@@ -4,6 +4,7 @@ from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import os
 import re
+import time
 import urllib.parse
 from typing import Any, Protocol
 
@@ -66,24 +67,8 @@ class MCPExternalSearchService(ExternalSearchService):
             "orderby": orderby,
             "sources": sources or [self.default_source],
         }
-        try:
-            raw_result = self.tool_invoker.call_tool(self.search_tool_name, arguments)
-        except Exception as exc:
-            if not self._is_rate_limit_error(exc):
-                print(f"MCP external search failed: {exc}")
-                return []
-
-            fallback_arguments = {
-                **arguments,
-                "limit": min(5, int(limit or config.MAX_EXTERNAL_QUERY_LIMIT)),
-                "date_from": None,
-                "sortby": "relevance",
-            }
-            try:
-                raw_result = self.tool_invoker.call_tool(self.search_tool_name, fallback_arguments)
-            except Exception as fallback_exc:
-                print(f"MCP external search failed after fallback: {fallback_exc}")
-                return []
+        raw_result = self.tool_invoker.call_tool(self.search_tool_name, arguments)
+        self._raise_if_search_result_has_errors(raw_result)
 
         candidates = self._coerce_candidate_list(raw_result)
         for candidate in candidates:
@@ -107,10 +92,12 @@ class MCPExternalSearchService(ExternalSearchService):
         max_workers = min(len(safe_plans), max(1, config.MAX_PARALLEL_EXTERNAL_QUERIES * self._count_sources(safe_plans)))
 
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            future_to_plan = {
-                executor.submit(self.search_papers, **query_plan): (index, query_plan)
-                for index, query_plan in enumerate(safe_plans)
-            }
+            future_to_plan = {}
+            source_last_submitted_at: dict[str, float] = {}
+            for index, query_plan in enumerate(safe_plans):
+                source = self._source_key_from_query_plan(query_plan)
+                self._wait_for_source_submit_interval(source, source_last_submitted_at)
+                future_to_plan[executor.submit(self.search_papers, **query_plan)] = (index, query_plan)
             for future in as_completed(future_to_plan):
                 index, query_plan = future_to_plan[future]
                 try:
@@ -151,37 +138,70 @@ class MCPExternalSearchService(ExternalSearchService):
             }
             return
         results_by_index: dict[int, list[ExternalPaperCandidate]] = {}
+        source_totals = self._count_query_plans_by_source(safe_plans)
+        source_completed: dict[str, int] = {source: 0 for source in source_totals}
+        source_result_counts: dict[str, int] = {source: 0 for source in source_totals}
+        source_error_counts: dict[str, int] = {source: 0 for source in source_totals}
         max_workers = min(len(safe_plans), max(1, config.MAX_PARALLEL_EXTERNAL_QUERIES * self._count_sources(safe_plans)))
 
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_to_plan = {}
+            source_last_submitted_at: dict[str, float] = {}
             for index, query_plan in enumerate(safe_plans):
                 query_id = self._build_query_step_id(index)
+                source = self._source_key_from_query_plan(query_plan)
+                self._wait_for_source_submit_interval(source, source_last_submitted_at)
                 yield {
                     "type": "search_query_start",
                     "query_id": query_id,
+                    **self._build_source_progress_payload(
+                        source=source,
+                        source_totals=source_totals,
+                        source_completed=source_completed,
+                        source_result_counts=source_result_counts,
+                        source_error_counts=source_error_counts,
+                    ),
                     **self._build_query_event_payload(query_plan),
                 }
                 future = executor.submit(self.search_papers, **query_plan)
-                future_to_plan[future] = (index, query_id, query_plan)
+                future_to_plan[future] = (index, query_id, query_plan, source)
 
             for future in as_completed(future_to_plan):
-                index, query_id, query_plan = future_to_plan[future]
+                index, query_id, query_plan, source = future_to_plan[future]
                 try:
                     candidates = future.result()
                     results_by_index[index] = candidates
+                    source_completed[source] = source_completed.get(source, 0) + 1
+                    source_result_counts[source] = source_result_counts.get(source, 0) + len(candidates)
                     yield {
                         "type": "search_query_done",
                         "query_id": query_id,
                         "result_count": len(candidates),
+                        **self._build_source_progress_payload(
+                            source=source,
+                            source_totals=source_totals,
+                            source_completed=source_completed,
+                            source_result_counts=source_result_counts,
+                            source_error_counts=source_error_counts,
+                        ),
                         **self._build_query_event_payload(query_plan),
                     }
                 except Exception as exc:  # pragma: no cover - 外部服务异常以日志为主
                     results_by_index[index] = []
+                    source_completed[source] = source_completed.get(source, 0) + 1
+                    source_error_counts[source] = source_error_counts.get(source, 0) + 1
                     yield {
                         "type": "search_query_error",
                         "query_id": query_id,
                         "error": str(exc),
+                        "error_kind": "rate_limited" if self._is_rate_limit_error(exc) else "request_failed",
+                        **self._build_source_progress_payload(
+                            source=source,
+                            source_totals=source_totals,
+                            source_completed=source_completed,
+                            source_result_counts=source_result_counts,
+                            source_error_counts=source_error_counts,
+                        ),
                         **self._build_query_event_payload(query_plan),
                     }
 
@@ -252,6 +272,30 @@ class MCPExternalSearchService(ExternalSearchService):
             if candidate is not None:
                 candidates.append(candidate)
         return candidates
+
+    def _raise_if_search_result_has_errors(self, payload: Any) -> None:
+        """当 MCP 返回错误且没有可用结果时抛出异常，避免把 429 误判为成功 0 篇。"""
+        if not isinstance(payload, dict):
+            return
+
+        items = payload.get("results")
+        errors = payload.get("errors")
+        has_results = isinstance(items, list) and len(items) > 0
+        if has_results or not isinstance(errors, list) or not errors:
+            return
+
+        error_messages: list[str] = []
+        for item in errors:
+            if isinstance(item, dict):
+                source = str(item.get("source") or "").strip()
+                message = str(item.get("message") or "").strip()
+                if source and message:
+                    error_messages.append(f"{source}: {message}")
+                elif message:
+                    error_messages.append(message)
+            elif item:
+                error_messages.append(str(item))
+        raise RuntimeError("; ".join(error_messages) or "MCP external search failed.")
 
     def _coerce_candidate(self, payload: Any) -> ExternalPaperCandidate | None:
         """把 MCP 返回的单篇论文结构规整为项目内部候选对象。"""
@@ -488,9 +532,60 @@ class MCPExternalSearchService(ExternalSearchService):
         message = str(exc).lower()
         return "429" in message or "too many requests" in message
 
+    def _wait_for_source_submit_interval(
+        self,
+        source: str,
+        source_last_submitted_at: dict[str, float],
+    ) -> None:
+        """对 arxiv 子任务做提交间隔控制，保证每个 query 至少间隔 3 秒。"""
+        normalized_source = (source or "").strip().lower()
+        if normalized_source != "arxiv":
+            return
+
+        now = time.perf_counter()
+        last_submitted_at = source_last_submitted_at.get(normalized_source)
+        if last_submitted_at is not None:
+            wait_seconds = 3.0 - (now - last_submitted_at)
+            if wait_seconds > 0:
+                time.sleep(wait_seconds)
+        source_last_submitted_at[normalized_source] = time.perf_counter()
+
     def _build_query_step_id(self, index: int) -> str:
         """为一条并发检索 query 构造前端可稳定更新的步骤 ID。"""
         return f"external-query-{index + 1}"
+
+    def _source_key_from_query_plan(self, query_plan: dict[str, Any]) -> str:
+        """从单条检索计划中提取规范化数据源名称。"""
+        sources = self._normalize_sources(query_plan.get("sources"))
+        return sources[0] if sources else self.default_source
+
+    def _count_query_plans_by_source(self, query_plans: list[dict[str, Any]]) -> dict[str, int]:
+        """统计每个数据源需要执行的子任务总数。"""
+        counts: dict[str, int] = {}
+        for query_plan in query_plans:
+            source = self._source_key_from_query_plan(query_plan)
+            counts[source] = counts.get(source, 0) + 1
+        return counts
+
+    def _build_source_progress_payload(
+        self,
+        *,
+        source: str,
+        source_totals: dict[str, int],
+        source_completed: dict[str, int],
+        source_result_counts: dict[str, int],
+        source_error_counts: dict[str, int],
+    ) -> dict[str, int]:
+        """构造按数据源聚合的检索进度，供工具链 trace 计算总耗时。"""
+        total = source_totals.get(source, 0)
+        completed = source_completed.get(source, 0)
+        return {
+            "source_total": total,
+            "source_completed": completed,
+            "source_remaining": max(0, total - completed),
+            "source_result_count": source_result_counts.get(source, 0),
+            "source_error_count": source_error_counts.get(source, 0),
+        }
 
     def _build_query_event_payload(self, query_plan: dict[str, Any]) -> dict[str, Any]:
         """把检索 query 参数转换为前端准备区事件载荷。"""
