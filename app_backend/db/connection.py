@@ -70,6 +70,10 @@ CREATE TABLE IF NOT EXISTS document_chunks (
     document_id INTEGER NOT NULL,
     chunk_index INTEGER NOT NULL,
     chunk_text TEXT NOT NULL,
+    section_type TEXT NOT NULL DEFAULT '',
+    section_title TEXT NOT NULL DEFAULT '',
+    section_chunk_index INTEGER NOT NULL DEFAULT 0,
+    indexable INTEGER NOT NULL DEFAULT 1,
     token_count INTEGER NOT NULL,
     vector_id TEXT NOT NULL,
     embedding_model TEXT NOT NULL,
@@ -402,7 +406,7 @@ class DatabaseManager:
                 )
 
     def _ensure_chunk_columns(self, connection: sqlite3.Connection, migration_library_id: int | None) -> None:
-        """Backfill chunk-level library ids for older databases."""
+        """Backfill chunk-level library ids and semantic chunk metadata for older databases."""
         chunk_columns = {
             row[1] for row in connection.execute("PRAGMA table_info(document_chunks)").fetchall()
         }
@@ -410,6 +414,17 @@ class DatabaseManager:
             connection.execute(
                 "ALTER TABLE document_chunks ADD COLUMN library_id INTEGER NOT NULL DEFAULT 0"
             )
+        semantic_chunk_defaults = {
+            "section_type": "TEXT NOT NULL DEFAULT ''",
+            "section_title": "TEXT NOT NULL DEFAULT ''",
+            "section_chunk_index": "INTEGER NOT NULL DEFAULT 0",
+            "indexable": "INTEGER NOT NULL DEFAULT 1",
+        }
+        for column_name, column_definition in semantic_chunk_defaults.items():
+            if column_name not in chunk_columns:
+                connection.execute(
+                    f"ALTER TABLE document_chunks ADD COLUMN {column_name} {column_definition}"
+                )
 
         if migration_library_id is not None:
             connection.execute(

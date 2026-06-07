@@ -89,6 +89,10 @@ class RetrieverService:
                     "document_type": document.document_type,
                     "file_path": document.file_path,
                     "chunk_index": metadata.get("chunk_index"),
+                    "section_type": metadata.get("section_type") or "",
+                    "section_title": metadata.get("section_title") or "",
+                    "section_chunk_index": metadata.get("section_chunk_index"),
+                    "indexable": metadata.get("indexable", True),
                     "chunk_text": item.page_content,
                     "recall_rank": recall_rank,
                 }

@@ -54,6 +54,7 @@ class PDFParserService:
             raw_text=full_text,
             page_count=len(page_texts),
             abstract_priority_text=abstract_priority_text,
+            page_texts=page_texts,
         )
 
     def compute_file_hash(self, file_path: str | Path) -> str:

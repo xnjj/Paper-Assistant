@@ -13,6 +13,7 @@ from langchain_core.prompts import ChatPromptTemplate
 from app_backend.models import ExtractedMetadata, ParsedDocument
 from app_backend.services.citation_formatter import format_gbt7714_citation
 from app_backend.services.config_service import ConfigService
+from app_backend.services.llm_concurrency_limiter import LLMConcurrencyLimiter
 
 logger = logging.getLogger(__name__)
 
@@ -84,9 +85,14 @@ class MetadataExtractorService:
     3. 最后统一做字段规范化，并生成默认引用格式。
     """
 
-    def __init__(self, config_service: ConfigService | None = None) -> None:
+    def __init__(
+        self,
+        config_service: ConfigService | None = None,
+        llm_limiter: LLMConcurrencyLimiter | None = None,
+    ) -> None:
         """初始化元数据抽取服务。"""
         self.config_service = config_service
+        self.llm_limiter = llm_limiter
 
     def extract(self, parsed_document: ParsedDocument) -> ExtractedMetadata:
         """从解析后的 PDF 中抽取结构化元数据。
@@ -157,12 +163,14 @@ class MetadataExtractorService:
         )
 
         chain = prompt | self._build_model() | StrOutputParser()
-        raw = chain.invoke(
-            {
-                "text": text_for_llm,
-                "rule_hints": json.dumps(rule_hints, ensure_ascii=False),
-            }
-        ).strip()
+        payload = {
+            "text": text_for_llm,
+            "rule_hints": json.dumps(rule_hints, ensure_ascii=False),
+        }
+        if self.llm_limiter is not None:
+            raw = self.llm_limiter.run(lambda: chain.invoke(payload)).strip()
+        else:
+            raw = chain.invoke(payload).strip()
         return self._parse_json_payload(raw)
 
     def _build_model(self) -> ChatTongyi:

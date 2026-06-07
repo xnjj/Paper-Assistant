@@ -14,19 +14,23 @@ ROOT_DIR = Path(__file__).resolve().parent
 OPENAI_API_KEY = os.getenv("DASHSCOPE_API_KEY", "")
 
 # ---------------------------- 检索配置 ----------------------------
-# TOP_K 是本地向量召回候选 chunk 数；RECALL_K 是本地重排后保留并送入问答的 chunk 数。
-TOP_K = 100
-RECALL_K = 20
-CHUNK_LIMIT_PER_PAPER = 2
+TOP_K = 100                             # 本地向量召回候选 chunk 数
+RECALL_K = 20                           # 本地重排后保留并送入问答的 chunk 数
+CHUNK_LIMIT_PER_PAPER = 5               # 每篇文献最多分块数
 
-# 外部检索与最终证据拼接上限。
-MAX_PARALLEL_EXTERNAL_QUERIES = 3
-MAX_PARALLEL_CROSSREF_QUERIES = 5
-MAX_PARALLEL_LLM_QUERIES = 10
-MAX_EXTERNAL_QUERY_LIMIT = 5
-MAX_SOURCE_FINAL_LIMIT = 10
-DEFAULT_EXTERNAL_FINAL_LIMIT = 20
-MAX_SEARCH_NUM = 30
+MAX_PARALLEL_EXTERNAL_QUERIES = 3       # 单个外部数据源最大并发请求查询数，防止过大被限流
+MAX_PARALLEL_CROSSREF_QUERIES = 5       # CROSSREF最大并发请求查询数
+MAX_PARALLEL_LLM_QUERIES = 10           # 最大并发 LLM 请求数
+MAX_EXTERNAL_QUERY_LIMIT = 5            # 单个外部数据源单次请求查询返回限制，防止过大被限流
+MAX_SOURCE_FINAL_LIMIT = 10             # 单个外部数据检索最终返回总数限制
+DEFAULT_EXTERNAL_FINAL_LIMIT = 20       # 所有外部数据源检索返回总数限制
+MAX_SEARCH_NUM = 30                     # 本地+外部检索总返回数限制
+
+# ---------------------------- 语义分块配置 ----------------------------
+# 每个语义结构识别任务读取的 PDF 页数；页数越大，上下文越完整，但单次 LLM 请求越慢。
+SEMANTIC_CHUNK_PAGES_PER_BATCH = 3
+# 单篇文献内部最多并发多少个结构识别任务；真实 LLM 总并发仍受 MAX_PARALLEL_LLM_QUERIES 统一限制。
+SEMANTIC_CHUNK_MAX_WORKERS_PER_DOCUMENT = 3
 
 OUTPUT_DIR = os.getenv("RAG_PAPER_ASSISTANT_DATA_DIR", str(ROOT_DIR / "daily_papers"))
 APP_DB_FILE = str(Path(OUTPUT_DIR) / "app_state.db")

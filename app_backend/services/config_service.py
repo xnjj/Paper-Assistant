@@ -35,7 +35,7 @@ class ConfigService:
                 "embedding_max_input_tokens": library_config["embedding_max_input_tokens"],
                 "chunk_mode": requested_chunk_mode,
                 "effective_chunk_mode": effective_chunk_mode,
-                "semantic_chunking_enabled": False,
+                "semantic_chunking_enabled": effective_chunk_mode == "semantic",
             },
             "session": session_config,
             "library_id": library_id,
@@ -154,10 +154,7 @@ class ConfigService:
 
     def get_effective_chunk_mode(self, library_id: int | None) -> str:
         """Return the chunk mode the runtime can actually execute."""
-        requested_mode = self._get_library_chunk_mode(library_id)
-        if requested_mode == "semantic":
-            return "recursive"
-        return requested_mode
+        return self._get_library_chunk_mode(library_id)
 
     def _merge_global_config(self) -> dict[str, object]:
         payloads = self.config_repository.get_many_json_values(

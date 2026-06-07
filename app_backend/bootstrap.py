@@ -15,12 +15,14 @@ from app_backend.services.document_ingest_service import DocumentIngestService
 from app_backend.services.agent_orchestrator_service import AgentOrchestratorService
 from app_backend.services.external_search_planner_service import ExternalSearchPlannerService
 from app_backend.services.library_sync_service import LibrarySyncService
+from app_backend.services.llm_concurrency_limiter import LLMConcurrencyLimiter
 from app_backend.services.memory_service import MemoryService
 from app_backend.services.metadata_extractor import MetadataExtractorService
 from app_backend.services.mcp_external_search_service import MCPExternalSearchService
 from app_backend.services.pdf_parser import PDFParserService
 from app_backend.services.rerank_service import RerankService
 from app_backend.services.retriever_service import RetrieverService
+from app_backend.services.semantic_chunk_service import SemanticChunkService
 from app_backend.services.stdio_mcp_tool_invoker import StdioMCPToolInvoker
 from app_backend.services.vector_index_service import VectorIndexService
 
@@ -45,8 +47,19 @@ class ServiceContainer:
             library_repository=self.library_repository,
         )
         self.pdf_parser = PDFParserService()
-        self.metadata_extractor = MetadataExtractorService(self.config_service)
-        self.vector_index_service = VectorIndexService(self.config_service)
+        self.llm_concurrency_limiter = LLMConcurrencyLimiter()
+        self.metadata_extractor = MetadataExtractorService(
+            self.config_service,
+            self.llm_concurrency_limiter,
+        )
+        self.semantic_chunk_service = SemanticChunkService(
+            config_service=self.config_service,
+            llm_limiter=self.llm_concurrency_limiter,
+        )
+        self.vector_index_service = VectorIndexService(
+            self.config_service,
+            self.semantic_chunk_service,
+        )
         self.rerank_service = RerankService()
 
         self.document_ingest_service = DocumentIngestService(

@@ -106,6 +106,10 @@ interface RetrievedDocument {
   publication_date?: string
   document_type?: string
   chunk_index?: number
+  section_type?: string
+  section_title?: string
+  section_chunk_index?: number | null
+  indexable?: boolean
   chunk_text: string
 }
 
@@ -137,6 +141,10 @@ interface CitationBinding {
   publication_date?: string
   document_type?: string
   chunk_index?: number
+  section_type?: string
+  section_title?: string
+  section_chunk_index?: number | null
+  indexable?: boolean
   chunk_text?: string
 }
 
@@ -205,6 +213,10 @@ interface TraceDetailDocument {
   url?: string
   file_path?: string
   chunk_index?: number | null
+  section_type?: string
+  section_title?: string
+  section_chunk_index?: number | null
+  indexable?: boolean
   rerank_score?: number | string | null
   abstract?: string
   chunk_text?: string
@@ -2236,6 +2248,13 @@ function getTraceDetailDocuments(span: AgentTraceSpan | null): TraceDetailDocume
       url: String(item.url || ''),
       file_path: String(item.file_path || ''),
       chunk_index: item.chunk_index === null || item.chunk_index === undefined ? null : Number(item.chunk_index),
+      section_type: String(item.section_type || ''),
+      section_title: String(item.section_title || ''),
+      section_chunk_index:
+        item.section_chunk_index === null || item.section_chunk_index === undefined
+          ? null
+          : Number(item.section_chunk_index),
+      indexable: item.indexable === undefined ? true : Boolean(item.indexable),
       rerank_score: item.rerank_score === null || item.rerank_score === undefined ? null : String(item.rerank_score),
       abstract: String(item.abstract || ''),
       chunk_text: String(item.chunk_text || ''),
@@ -2943,6 +2962,10 @@ function citationBindingToDocument(citation: CitationBinding): RetrievedDocument
     publication_date: citation.publication_date,
     document_type: citation.document_type,
     chunk_index: citation.chunk_index,
+    section_type: citation.section_type,
+    section_title: citation.section_title,
+    section_chunk_index: citation.section_chunk_index,
+    indexable: citation.indexable,
     chunk_text: citation.chunk_text || '',
   }
 }

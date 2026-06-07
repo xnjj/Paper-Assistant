@@ -822,6 +822,10 @@ Agent 操作记录：
                     "url": document.get("url") or "",
                     "file_path": document.get("file_path") or "",
                     "chunk_index": document.get("chunk_index"),
+                    "section_type": document.get("section_type") or "",
+                    "section_title": document.get("section_title") or "",
+                    "section_chunk_index": document.get("section_chunk_index"),
+                    "indexable": document.get("indexable", True),
                     "rerank_score": document.get("rerank_score"),
                     "abstract": self._truncate_trace_text(str(document.get("abstract") or ""), 500),
                     "chunk_text": self._truncate_trace_text(str(document.get("chunk_text") or ""), 700),
@@ -1067,6 +1071,10 @@ Agent 操作记录：
             "publication_date": document.get("publication_date") or "",
             "document_type": document.get("document_type") or "",
             "chunk_index": document.get("chunk_index"),
+            "section_type": document.get("section_type") or "",
+            "section_title": document.get("section_title") or "",
+            "section_chunk_index": document.get("section_chunk_index"),
+            "indexable": document.get("indexable", True),
             "chunk_text": document.get("chunk_text") or "",
         }
 
@@ -1190,6 +1198,10 @@ Agent 操作记录：
             doi = item.get("doi") or "无"
             url = item.get("url") or "无"
             citation = self._format_citation_text(item) or "无"
+            section_type = item.get("section_type") or "无"
+            section_title = item.get("section_title") or "无"
+            section_chunk_index = item.get("section_chunk_index")
+            section_chunk_text = section_chunk_index if section_chunk_index is not None else "无"
             source_id = item.get("source_id")
             if not source_id and item.get("document_id") is not None:
                 source_id = self._build_source_id(int(item["document_id"]))
@@ -1203,6 +1215,9 @@ Agent 操作记录：
                 f"  DOI: {doi}\n"
                 f"  URL: {url}\n"
                 f"  默认引用文本: {citation}\n"
+                f"  章节类型: {section_type}\n"
+                f"  章节标题: {section_title}\n"
+                f"  章节内分块序号: {section_chunk_text}\n"
                 f"  若在正文中引用该文献，请写成 [@{source_id}]\n"
                 f"  摘要: {item.get('abstract') or '无'}\n"
                 f"  证据片段: {item.get('chunk_text') or '无'}"

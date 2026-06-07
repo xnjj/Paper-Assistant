@@ -21,6 +21,7 @@ class ParsedDocument:
     raw_text: str
     page_count: int
     abstract_priority_text: str = ""
+    page_texts: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -104,6 +105,10 @@ class DocumentChunkRecord:
     vector_id: str
     embedding_model: str
     created_at: str
+    section_type: str = ""
+    section_title: str = ""
+    section_chunk_index: int = 0
+    indexable: bool = True
 
 
 @dataclass

@@ -333,7 +333,7 @@ class DocumentIngestService:
         self._index_document_contents(
             library=library,
             document_id=document_id,
-            text=parsed_document.raw_text,
+            parsed_document=parsed_document,
         )
         self.document_repository.update_document_index_state(
             document_id,
@@ -373,7 +373,7 @@ class DocumentIngestService:
         self._index_document_contents(
             library=library,
             document_id=document.id,
-            text=parsed_document.raw_text,
+            parsed_document=parsed_document,
         )
         self.document_repository.update_document_index_state(
             document.id,
@@ -386,14 +386,14 @@ class DocumentIngestService:
         *,
         library: LibraryRecord,
         document_id: int,
-        text: str,
+        parsed_document: ParsedDocument,
     ) -> None:
         """Write vector chunks and structured chunk rows for one document."""
         indexed_chunks = self.vector_index_service.index_document(
             library_id=library.id,
             collection_name=library.collection_name,
             document_id=document_id,
-            text=text,
+            parsed_document=parsed_document,
         )
         for chunk in indexed_chunks:
             self.document_repository.add_chunk(

@@ -134,6 +134,10 @@ class DocumentRepository:
         token_count: int,
         vector_id: str,
         embedding_model: str,
+        section_type: str = "",
+        section_title: str = "",
+        section_chunk_index: int = 0,
+        indexable: bool = True,
     ) -> None:
         """Persist one chunk record for a document."""
         now = datetime.now().isoformat(timespec="seconds")
@@ -141,16 +145,21 @@ class DocumentRepository:
             connection.execute(
                 """
                 INSERT OR REPLACE INTO document_chunks(
-                    library_id, document_id, chunk_index, chunk_text, token_count,
-                    vector_id, embedding_model, created_at
+                    library_id, document_id, chunk_index, chunk_text,
+                    section_type, section_title, section_chunk_index, indexable,
+                    token_count, vector_id, embedding_model, created_at
                 )
-                VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     library_id,
                     document_id,
                     chunk_index,
                     chunk_text,
+                    section_type,
+                    section_title,
+                    int(section_chunk_index),
+                    1 if indexable else 0,
                     token_count,
                     vector_id,
                     embedding_model,
