@@ -214,6 +214,13 @@ class LibraryRepository:
                 "DELETE FROM library_sync_jobs WHERE library_id = ?",
                 (library_id,),
             )
+            try:
+                connection.execute(
+                    "DELETE FROM document_chunks_fts WHERE library_id = ?",
+                    (library_id,),
+                )
+            except Exception:
+                pass
             connection.execute(
                 "DELETE FROM document_chunks WHERE library_id = ?",
                 (library_id,),

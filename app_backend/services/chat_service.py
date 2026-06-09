@@ -146,7 +146,6 @@ class ChatService:
         self,
         session_id: int,
         user_message: str,
-        top_k: int = 5,
         allow_external_search: bool = False,
     ) -> Iterator[dict[str, Any]]:
         """处理一次流式聊天请求。"""
@@ -161,7 +160,6 @@ class ChatService:
         for agent_event in self.agent_orchestrator_service.stream_prepare_chat_context(
             session_id=session_id,
             user_message=user_message,
-            top_k=top_k,
             external_search_only=False,
             allow_external_search=allow_external_search,
         ):
@@ -301,11 +299,6 @@ class ChatService:
         document_context = self._format_documents(prompt_payload["retrieved_docs"])
 
         prompt = self._build_orchestrated_prompt(
-            session_goal=orchestrated_context.session.user_goal,
-            library_name=orchestrated_context.library.name if orchestrated_context.library else "未绑定文献库",
-            retrieval_mode=prompt_payload["retrieval_mode"],
-            coverage=prompt_payload["coverage"],
-            agent_actions=prompt_payload["agent_actions"],
             memory_context=memory_context,
             document_context=document_context,
             history_context=history_context,
@@ -318,26 +311,42 @@ class ChatService:
             "retrieved_docs": prompt_payload["retrieved_docs"],
             "local_documents": orchestrated_context.local_documents,
             "external_documents": orchestrated_context.external_documents,
+            "local_retrieval_trace": orchestrated_context.local_retrieval_trace,
+            "external_rerank_trace": orchestrated_context.external_rerank_trace,
             "prompt": prompt,
             "prompt_trace_preview": self._build_prompt_trace_preview(prompt),
             "retrieval_mode": prompt_payload["retrieval_mode"],
             "coverage": prompt_payload["coverage"],
             "agent_actions": prompt_payload["agent_actions"],
             "pending_ingest": prompt_payload["pending_ingest"],
-            "local_document_count": len(orchestrated_context.local_documents),
-            "external_document_count": len(orchestrated_context.external_documents),
+            "local_document_count": self._count_selected_documents_by_source_type(
+                prompt_payload["retrieved_docs"],
+                "local",
+            ),
+            "external_document_count": self._count_selected_documents_by_source_type(
+                prompt_payload["retrieved_docs"],
+                "external",
+            ),
             "orchestration": prompt_payload,
         }
+
+    def _count_selected_documents_by_source_type(self, documents: list[dict[str, Any]], source_type: str) -> int:
+        """统计最终上下文中指定来源类型的证据数量。"""
+        expected = source_type.strip().lower()
+        count = 0
+        for document in documents:
+            current_source_type = str(document.get("source_type") or "").strip().lower()
+            source_id = str(document.get("source_id") or "").strip().lower()
+            if not current_source_type:
+                current_source_type = "external" if source_id.startswith("ext_") else "local"
+            if current_source_type == expected:
+                count += 1
+        return count
 
 
     def _build_orchestrated_prompt(
         self,
         *,
-        session_goal: str,
-        library_name: str,
-        retrieval_mode: str,
-        coverage: Any,
-        agent_actions: Any,
         memory_context: str,
         document_context: str,
         history_context: str,
@@ -345,22 +354,7 @@ class ChatService:
     ) -> str:
         """构造用于最终回答模型的中文提示词。"""
         return f"""
-你是论文助手 agent。请基于会话目标、历史消息、记忆、Agent 操作记录和候选文献证据，用中文严谨回答用户问题。
-
-当前会话目标：
-{session_goal}
-
-当前文献库：
-{library_name}
-
-检索模式：
-{retrieval_mode}
-
-检索覆盖评估：
-{coverage}
-
-Agent 操作记录：
-{agent_actions}
+你是论文助手 agent。请基于候选文献证据、相关记忆和最近会话历史，用中文严谨回答用户问题。
 
 相关记忆：
 {memory_context}
@@ -378,15 +372,15 @@ Agent 操作记录：
 1. 优先依据已提供的文献证据作答，不要脱离证据自由发挥。
 2. 如果现有证据不足，请明确说明证据不足，不要编造出处。
 3. 回答正文使用中文，表达准确、克制、学术化。
-4. 如果检索模式为 no_library 且候选文献证据为“无”，可以基于通用知识回答，但不要伪造文献引用。
-4. 如果需要引用文献，只能使用候选文献证据中给出的 source_id，并在正文中写成 [@source_id] 的形式。
-5. 不要自行生成 [1]、[2] 这类编号；编号和参考文献表将由系统统一生成。
-6. 同一篇文献多次引用时，必须复用同一个 source_id。
-7. 如果需要在正文中引用多篇文献，使用','进行分隔，例如 [@source_id1, @source_id2] ，不要使用';'、' '、'-'、'，'等其他分隔符。
-7. 不要输出“参考文献”标题，也不要自行在文末手写参考文献列表。
-8. 不要引用未在候选文献证据中出现的 source_id。
-9. 如果没有足够证据支持某个判断，请直接说明证据不足。
-10. 请直接输出最终答案正文。
+4. 如果候选文献证据为“无”，可以基于通用知识回答，但不要伪造文献引用。
+5. 如果需要引用文献，只能使用候选文献证据中给出的 source_id，并在正文中写成 [@source_id] 的形式。
+6. 不要自行生成 [1]、[2] 这类编号；编号和参考文献表将由系统统一生成。
+7. 同一篇文献多次引用时，必须复用同一个 source_id。
+8. 如果需要在正文中引用多篇文献，使用','进行分隔，例如 [@source_id1, @source_id2]，不要使用';'、' '、'-'、'，'等其他分隔符。
+9. 不要输出“参考文献”标题，也不要自行在文末手写参考文献列表。
+10. 不要引用未在候选文献证据中出现的 source_id。
+11. 如果没有足够证据支持某个判断，请直接说明证据不足。
+12. 请直接输出最终答案正文。
 """.strip()
 
 
@@ -575,27 +569,9 @@ Agent 操作记录：
             self._record_external_source_trace(trace, step, status, source)
             return
 
-        span_id = "local_retrieval"
-        input_payload = {
-            "source": source,
-            "query": step.get("query") or "",
-            "sort_by": step.get("sort_by") or "",
-            "sort_order": step.get("sort_order") or "",
-            "request_url": step.get("request_url") or "",
-        }
-
-        if status == "running":
-            self._start_trace_span(trace, name=span_id, span_type="retriever", input_payload=input_payload)
-            return
-
-        self._finish_trace_span(
-            trace,
-            span_id=span_id,
-            status="error" if status == "error" else "success",
-            output_payload={"result_count": step.get("result_count")},
-            metrics={"result_count": step.get("result_count")},
-            error=str(step.get("error") or ""),
-        )
+        # 本地检索现在拆分为向量召回、关键词召回、RRF 融合和重排四个 span，
+        # 由 _record_context_trace() 基于 retriever 诊断数据统一写入。
+        return
 
     def _record_coverage_trace(self, trace: dict[str, Any], step: dict[str, Any], status: str) -> None:
         """记录证据充分性判断 span，耗时覆盖完整 LLM 判断调用。"""
@@ -733,13 +709,155 @@ Agent 操作记录：
             "request_urls": request_urls,
         }
 
+    def _record_local_retrieval_trace(
+        self,
+        trace: dict[str, Any],
+        local_trace: dict[str, Any],
+        *,
+        local_usefulness: dict[str, str] | None = None,
+    ) -> None:
+        """把本地 hybrid retrieval 细分阶段写入工具链 trace。"""
+        if not isinstance(local_trace, dict) or not local_trace:
+            return
+
+        local_spans = [
+            self._build_local_retrieval_span(
+                name="vector_recall",
+                span_type="recall",
+                trace_payload=local_trace.get("vector_recall"),
+                input_payload={"method": "chroma_vector"},
+                include_elapsed=True,
+                local_usefulness=local_usefulness,
+            ),
+            self._build_local_retrieval_span(
+                name="keyword_recall",
+                span_type="recall",
+                trace_payload=local_trace.get("keyword_recall"),
+                input_payload={"method": "sqlite_fts5_bm25"},
+                include_elapsed=True,
+                local_usefulness=local_usefulness,
+            ),
+            self._build_local_retrieval_span(
+                name="hybrid_rrf",
+                span_type="rrf",
+                trace_payload=local_trace.get("hybrid_rrf"),
+                input_payload={"method": "reciprocal_rank_fusion"},
+                include_elapsed=False,
+                local_usefulness=local_usefulness,
+            ),
+            self._build_local_retrieval_span(
+                name="local_retrieval",
+                span_type="rerank",
+                trace_payload=local_trace.get("local_rerank"),
+                input_payload={"method": "local_rerank"},
+                include_elapsed=True,
+                local_usefulness=local_usefulness,
+            ),
+        ]
+        prepared_spans = [span for span in local_spans if span is not None]
+        if not prepared_spans:
+            return
+
+        spans = self._trace_spans(trace)
+        existing_names = {str(span.get("name") or "") for span in spans}
+        prepared_spans = [span for span in prepared_spans if str(span.get("name") or "") not in existing_names]
+        if not prepared_spans:
+            return
+
+        insert_index = self._find_first_trace_index(
+            spans,
+            {"coverage_assessment", "search_plan_generation"},
+            prefix="external_search.",
+        )
+        spans[insert_index:insert_index] = prepared_spans
+
+    def _build_local_retrieval_span(
+        self,
+        *,
+        name: str,
+        span_type: str,
+        trace_payload: Any,
+        input_payload: dict[str, Any],
+        include_elapsed: bool,
+        local_usefulness: dict[str, str] | None = None,
+    ) -> dict[str, Any] | None:
+        """构造一个已完成的本地检索 trace span。"""
+        if not isinstance(trace_payload, dict):
+            return None
+
+        documents = trace_payload.get("documents") if isinstance(trace_payload.get("documents"), list) else []
+        elapsed_ms = trace_payload.get("elapsed_ms")
+        metrics = {
+            "result_count": trace_payload.get("result_count", len(documents)),
+            "top_k": trace_payload.get("top_k"),
+            "rrf_k": trace_payload.get("rrf_k"),
+        }
+        if include_elapsed and isinstance(elapsed_ms, int):
+            metrics["elapsed_ms"] = elapsed_ms
+
+        return {
+            "span_id": name,
+            "parent_id": None,
+            "name": name,
+            "type": span_type,
+            "status": "success",
+            "started_at": self._now_iso(),
+            "finished_at": self._now_iso(),
+            "elapsed_ms": elapsed_ms if include_elapsed and isinstance(elapsed_ms, int) else None,
+            "input": {
+                **input_payload,
+                "provider": trace_payload.get("provider") or "",
+                "fallback_used": bool(trace_payload.get("fallback_used")),
+            },
+            "output": {
+                "result_count": trace_payload.get("result_count", len(documents)),
+                "rerank_provider": trace_payload.get("provider") or "",
+                "fallback_used": bool(trace_payload.get("fallback_used")),
+                "fallback_error": trace_payload.get("fallback_error") or "",
+                "documents": self._summarize_trace_documents(
+                    documents,
+                    max_items=max(30, len(documents)),
+                    chunk_text_chars=0,
+                    local_usefulness=local_usefulness,
+                ),
+            },
+            "metrics": {key: value for key, value in metrics.items() if value is not None},
+            "error": "",
+        }
+
+    def _find_first_trace_index(
+        self,
+        spans: list[dict[str, Any]],
+        names: set[str],
+        *,
+        prefix: str,
+    ) -> int:
+        """查找插入本地检索 span 的位置。"""
+        for index, span in enumerate(spans):
+            name = str(span.get("name") or "")
+            if name in names or name.startswith(prefix):
+                return index
+        return len(spans)
+
     def _record_context_trace(self, trace: dict[str, Any], context: dict[str, Any]) -> None:
         """根据编排上下文补充动作、证据合并和提示词构造等 trace span。"""
         retrieved_docs = context.get("retrieved_docs") or []
         local_documents = context.get("local_documents") or []
         external_documents = context.get("external_documents") or []
         memories = context.get("memories") or []
-        self._attach_retrieval_documents_to_trace(trace, local_documents, external_documents)
+        local_usefulness = self._build_local_usefulness_map(context.get("coverage") or {})
+        self._record_local_retrieval_trace(
+            trace,
+            context.get("local_retrieval_trace") or {},
+            local_usefulness=local_usefulness,
+        )
+        self._attach_retrieval_documents_to_trace(
+            trace,
+            local_documents,
+            external_documents,
+            local_usefulness=local_usefulness,
+        )
+        self._record_external_rerank_trace(trace, context.get("external_rerank_trace") or {})
         self._append_trace_span(
             trace,
             name="evidence_merge",
@@ -750,7 +868,12 @@ Agent 操作记录：
                 "selected_document_count": len(retrieved_docs),
                 "local_document_count": context.get("local_document_count") or 0,
                 "external_document_count": context.get("external_document_count") or 0,
-                "documents": self._summarize_trace_documents(retrieved_docs),
+                "documents": self._summarize_trace_documents(
+                    retrieved_docs,
+                    max_items=max(30, len(retrieved_docs)),
+                    chunk_text_chars=0,
+                    local_usefulness=local_usefulness,
+                ),
             },
         )
         self._append_trace_span(
@@ -773,13 +896,20 @@ Agent 操作记录：
         trace: dict[str, Any],
         local_documents: list[dict[str, Any]],
         external_documents: list[dict[str, Any]],
+        *,
+        local_usefulness: dict[str, str] | None = None,
     ) -> None:
         """把最终上下文中的检索文献补写到已完成的本地和外部检索 trace span。"""
         local_span = self._find_trace_span(self._trace_spans(trace), "local_retrieval")
         if local_span is not None:
             local_span["output"] = {
                 **(local_span.get("output") or {}),
-                "documents": self._summarize_trace_documents(local_documents),
+                "documents": self._summarize_trace_documents(
+                    local_documents,
+                    max_items=max(30, len(local_documents)),
+                    chunk_text_chars=0,
+                    local_usefulness=local_usefulness,
+                ),
             }
 
         for span in self._trace_spans(trace):
@@ -792,8 +922,59 @@ Agent 操作记录：
             ]
             span["output"] = {
                 **(span.get("output") or {}),
-                "documents": self._summarize_trace_documents(matched_documents),
+                "documents": self._summarize_trace_documents(matched_documents, include_chunk_text=False),
             }
+
+    def _record_external_rerank_trace(self, trace: dict[str, Any], rerank_trace: dict[str, Any]) -> None:
+        """把外部 paper 级重排写入工具链 trace。"""
+        if not isinstance(rerank_trace, dict) or not rerank_trace:
+            return
+
+        spans = self._trace_spans(trace)
+        if self._find_trace_span(spans, "external_rerank") is not None:
+            return
+
+        documents = rerank_trace.get("documents") if isinstance(rerank_trace.get("documents"), list) else []
+        elapsed_ms = rerank_trace.get("elapsed_ms")
+        skipped = bool(rerank_trace.get("skipped"))
+        metrics = {
+            "candidate_count": rerank_trace.get("candidate_count", len(documents)),
+            "result_count": rerank_trace.get("result_count", len(documents)),
+            "top_k": rerank_trace.get("top_k"),
+        }
+        if isinstance(elapsed_ms, int):
+            metrics["elapsed_ms"] = elapsed_ms
+
+        spans.append(
+            {
+                "span_id": "external_rerank",
+                "parent_id": None,
+                "name": "external_rerank",
+                "type": "rerank",
+                "status": "skipped" if skipped else "success",
+                "started_at": self._now_iso(),
+                "finished_at": self._now_iso(),
+                "elapsed_ms": elapsed_ms if isinstance(elapsed_ms, int) else None,
+                "input": {
+                    "method": "external_paper_rerank",
+                    "provider": rerank_trace.get("provider") or "",
+                    "fallback_used": bool(rerank_trace.get("fallback_used")),
+                    "candidate_count": rerank_trace.get("candidate_count", len(documents)),
+                    "external_quota": rerank_trace.get("external_quota"),
+                },
+                "output": {
+                    "result_count": rerank_trace.get("result_count", len(documents)),
+                    "rerank_provider": rerank_trace.get("provider") or "",
+                    "fallback_used": bool(rerank_trace.get("fallback_used")),
+                    "fallback_error": rerank_trace.get("fallback_error") or "",
+                    "skipped": skipped,
+                    "skip_reason": rerank_trace.get("skip_reason") or "",
+                    "documents": self._summarize_trace_documents(documents, include_chunk_text=False),
+                },
+                "metrics": {key: value for key, value in metrics.items() if value is not None},
+                "error": "",
+            }
+        )
 
     def _document_matches_external_source(self, document: dict[str, Any], source: str) -> bool:
         """判断一条外部文献是否属于指定数据源 trace span。"""
@@ -805,32 +986,121 @@ Agent 操作记录：
                 return True
         return source_id.startswith(f"ext_{normalized_source}_")
 
-    def _summarize_trace_documents(self, documents: list[dict[str, Any]], *, max_items: int = 30) -> list[dict[str, Any]]:
+    def _build_local_usefulness_map(self, coverage: dict[str, Any]) -> dict[str, str]:
+        """从充分性判断结果中构造本地 chunk 的 LLM 有用性判定映射。"""
+        if not isinstance(coverage, dict):
+            return {}
+
+        usefulness: dict[str, str] = {}
+        discarded_ids = coverage.get("discarded_local_evidence_ids") or coverage.get("discarded_local_source_ids")
+        useful_ids = coverage.get("useful_local_evidence_ids") or coverage.get("useful_local_source_ids")
+        for evidence_id in self._coerce_string_list(discarded_ids):
+            usefulness[evidence_id] = "useless"
+        for evidence_id in self._coerce_string_list(useful_ids):
+            usefulness[evidence_id] = "useful"
+        return usefulness
+
+    def _coerce_string_list(self, value: Any) -> list[str]:
+        """把可能来自模型的字符串或数组统一转换为去重字符串列表。"""
+        if isinstance(value, str):
+            candidates = [value]
+        elif isinstance(value, list):
+            candidates = value
+        else:
+            candidates = []
+
+        values: list[str] = []
+        for item in candidates:
+            text = str(item or "").strip()
+            if text and text not in values:
+                values.append(text)
+        return values
+
+    def _resolve_local_usefulness(
+        self,
+        document: dict[str, Any],
+        local_usefulness: dict[str, str] | None,
+    ) -> str:
+        """读取本地 chunk 的 LLM 判定结果，兼容 evidence_id 和 source_id 两种粒度。"""
+        if not local_usefulness:
+            return ""
+        source_id = str(document.get("source_id") or "").strip()
+        if source_id.startswith("ext_"):
+            return ""
+        evidence_id = self._build_local_evidence_id(document)
+        return local_usefulness.get(evidence_id) or local_usefulness.get(source_id) or ""
+
+    def _build_local_evidence_id(self, document: dict[str, Any]) -> str:
+        """为本地候选 chunk 构造与充分性判断一致的 evidence_id。"""
+        source_id = str(document.get("source_id") or "").strip()
+        if not source_id and document.get("document_id") is not None:
+            source_id = self._build_source_id(int(document["document_id"]))
+        if not source_id or source_id.startswith("ext_"):
+            return ""
+        chunk_index = document.get("chunk_index")
+        chunk_text = chunk_index if chunk_index is not None else "unknown"
+        return f"{source_id}#chunk_{chunk_text}"
+
+    def _summarize_trace_documents(
+        self,
+        documents: list[dict[str, Any]],
+        *,
+        max_items: int = 30,
+        chunk_text_chars: int = 700,
+        include_chunk_text: bool = True,
+        local_usefulness: dict[str, str] | None = None,
+    ) -> list[dict[str, Any]]:
         """把文献压缩成 trace 弹窗可读结构，避免把完整 chunk 和长摘要全部写入数据库。"""
         summarized: list[dict[str, Any]] = []
         for document in documents[:max_items]:
-            summarized.append(
-                {
-                    "document_id": document.get("document_id"),
-                    "source_id": document.get("source_id") or "",
-                    "source_type": document.get("source_type") or "",
-                    "title": document.get("title") or "",
-                    "authors": document.get("authors") or [],
-                    "year": document.get("year") or "",
-                    "venue": document.get("venue") or "",
-                    "doi": document.get("doi") or "",
-                    "url": document.get("url") or "",
-                    "file_path": document.get("file_path") or "",
-                    "chunk_index": document.get("chunk_index"),
-                    "section_type": document.get("section_type") or "",
-                    "section_title": document.get("section_title") or "",
-                    "section_chunk_index": document.get("section_chunk_index"),
-                    "indexable": document.get("indexable", True),
-                    "rerank_score": document.get("rerank_score"),
-                    "abstract": self._truncate_trace_text(str(document.get("abstract") or ""), 500),
-                    "chunk_text": self._truncate_trace_text(str(document.get("chunk_text") or ""), 700),
-                }
-            )
+            payload = {
+                "document_id": document.get("document_id"),
+                "source_id": document.get("source_id") or "",
+                "source_type": document.get("source_type") or "",
+                "title": document.get("title") or "",
+                "authors": document.get("authors") or [],
+                "year": document.get("year") or "",
+                "venue": document.get("venue") or "",
+                "doi": document.get("doi") or "",
+                "url": document.get("url") or "",
+                "file_path": document.get("file_path") or "",
+                "chunk_index": document.get("chunk_index"),
+                "chunk_end_index": document.get("chunk_end_index"),
+                "merged_chunk_indexes": document.get("merged_chunk_indexes") or [],
+                "section_type": document.get("section_type") or "",
+                "section_title": document.get("section_title") or "",
+                "section_chunk_index": document.get("section_chunk_index"),
+                "indexable": document.get("indexable", True),
+                "rerank_score": document.get("rerank_score"),
+                "qwen_rerank_score": document.get("qwen_rerank_score"),
+                "rerank_provider": document.get("rerank_provider") or "",
+                "vector_rank": document.get("vector_rank"),
+                "keyword_rank": document.get("keyword_rank"),
+                "keyword_score": document.get("keyword_score"),
+                "hybrid_rank": document.get("hybrid_rank"),
+                "hybrid_score": document.get("hybrid_score"),
+                "recall_source": document.get("recall_source") or "",
+                "evidence_id": self._build_local_evidence_id(document),
+                "llm_usefulness": self._resolve_local_usefulness(document, local_usefulness),
+                "abstract": self._truncate_trace_text(str(document.get("abstract") or ""), 500),
+                "chunk_text": (
+                    self._truncate_trace_text(str(document.get("chunk_text") or ""), chunk_text_chars)
+                    if chunk_text_chars > 0
+                    else str(document.get("chunk_text") or "").strip()
+                )
+                if include_chunk_text
+                else "",
+            }
+            merged_chunks = document.get("merged_chunks")
+            if isinstance(merged_chunks, list) and merged_chunks:
+                payload["merged_chunks"] = self._summarize_trace_documents(
+                    [chunk for chunk in merged_chunks if isinstance(chunk, dict)],
+                    max_items=len(merged_chunks),
+                    chunk_text_chars=0,
+                    include_chunk_text=False,
+                    local_usefulness=local_usefulness,
+                )
+            summarized.append(payload)
         return summarized
 
     def _build_prompt_trace_preview(self, prompt: str) -> str:
@@ -1202,6 +1472,12 @@ Agent 操作记录：
             section_title = item.get("section_title") or "无"
             section_chunk_index = item.get("section_chunk_index")
             section_chunk_text = section_chunk_index if section_chunk_index is not None else "无"
+            merged_chunk_indexes = item.get("merged_chunk_indexes")
+            merged_chunk_text = (
+                ", ".join(str(index) for index in merged_chunk_indexes)
+                if isinstance(merged_chunk_indexes, list) and merged_chunk_indexes
+                else "无"
+            )
             source_id = item.get("source_id")
             if not source_id and item.get("document_id") is not None:
                 source_id = self._build_source_id(int(item["document_id"]))
@@ -1218,6 +1494,7 @@ Agent 操作记录：
                 f"  章节类型: {section_type}\n"
                 f"  章节标题: {section_title}\n"
                 f"  章节内分块序号: {section_chunk_text}\n"
+                f"  合并分块: {merged_chunk_text}\n"
                 f"  若在正文中引用该文献，请写成 [@{source_id}]\n"
                 f"  摘要: {item.get('abstract') or '无'}\n"
                 f"  证据片段: {item.get('chunk_text') or '无'}"
@@ -1229,7 +1506,13 @@ Agent 操作记录：
         recent = messages[-limit:]
         if not recent:
             return "无"
-        return "\n".join(f"{message.role}: {message.content}" for message in recent)
+        formatted_messages: list[str] = []
+        for message in recent:
+            content = message.content or ""
+            if message.role == "assistant":
+                content = self._strip_reference_section(content)
+            formatted_messages.append(f"{message.role}: {content}")
+        return "\n".join(formatted_messages)
 
     def _memory_to_dict(self, memory: MemoryRecord) -> dict[str, Any]:
         """把记忆记录转换为可 JSON 序列化的字典。"""

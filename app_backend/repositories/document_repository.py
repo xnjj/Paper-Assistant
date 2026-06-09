@@ -5,6 +5,7 @@ from datetime import datetime
 
 from app_backend.db.connection import DatabaseManager
 from app_backend.models import DocumentRecord
+from app_backend.utils.keyword_text import build_keyword_search_text
 
 
 class DocumentRepository:
@@ -166,6 +167,12 @@ class DocumentRepository:
                     now,
                 ),
             )
+            self._upsert_chunk_fts_row(
+                connection,
+                library_id=library_id,
+                document_id=document_id,
+                chunk_index=chunk_index,
+            )
 
     def count_chunks(self, document_id: int) -> int:
         """Return the number of stored chunks for one document."""
@@ -179,6 +186,7 @@ class DocumentRepository:
     def delete_chunks(self, document_id: int) -> None:
         """Delete all structured chunk rows for one document."""
         with self.db_manager.get_connection() as connection:
+            self._delete_chunk_fts_rows(connection, document_id=document_id)
             connection.execute(
                 "DELETE FROM document_chunks WHERE document_id = ?",
                 (document_id,),
@@ -187,11 +195,84 @@ class DocumentRepository:
     def delete_document(self, document_id: int) -> bool:
         """Delete one document row by primary key."""
         with self.db_manager.get_connection() as connection:
+            self._delete_chunk_fts_rows(connection, document_id=document_id)
             cursor = connection.execute(
                 "DELETE FROM documents WHERE id = ?",
                 (document_id,),
             )
             return cursor.rowcount > 0
+
+    def _upsert_chunk_fts_row(
+        self,
+        connection,
+        *,
+        library_id: int,
+        document_id: int,
+        chunk_index: int,
+    ) -> None:
+        """同步维护单个分块的 FTS5 关键词索引，失败时不阻断主入库流程。"""
+        try:
+            chunk_row = connection.execute(
+                """
+                SELECT *
+                FROM document_chunks
+                WHERE document_id = ? AND chunk_index = ?
+                """,
+                (document_id, chunk_index),
+            ).fetchone()
+            document_row = connection.execute(
+                "SELECT * FROM documents WHERE id = ?",
+                (document_id,),
+            ).fetchone()
+            if chunk_row is None or document_row is None:
+                return
+
+            connection.execute(
+                """
+                DELETE FROM document_chunks_fts
+                WHERE document_id = ? AND chunk_index = ?
+                """,
+                (document_id, chunk_index),
+            )
+            connection.execute(
+                """
+                INSERT INTO document_chunks_fts(
+                    chunk_id, library_id, document_id, chunk_index,
+                    title, abstract, keywords, section_title, chunk_text, search_text
+                )
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    int(chunk_row["id"]),
+                    library_id,
+                    document_id,
+                    chunk_index,
+                    document_row["title"] or "",
+                    document_row["abstract"] or "",
+                    document_row["keywords_json"] or "",
+                    chunk_row["section_title"] or "",
+                    chunk_row["chunk_text"] or "",
+                    build_keyword_search_text(
+                        document_row["title"],
+                        document_row["abstract"],
+                        document_row["keywords_json"],
+                        chunk_row["section_title"],
+                        chunk_row["chunk_text"],
+                    ),
+                ),
+            )
+        except Exception:
+            return
+
+    def _delete_chunk_fts_rows(self, connection, *, document_id: int) -> None:
+        """删除某篇文献对应的 FTS5 索引行，兼容未启用 FTS5 的环境。"""
+        try:
+            connection.execute(
+                "DELETE FROM document_chunks_fts WHERE document_id = ?",
+                (document_id,),
+            )
+        except Exception:
+            return
 
     def update_document_index_state(
         self,

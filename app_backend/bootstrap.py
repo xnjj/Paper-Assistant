@@ -14,12 +14,14 @@ from app_backend.services.crossref_metadata_enrichment_service import CrossrefMe
 from app_backend.services.document_ingest_service import DocumentIngestService
 from app_backend.services.agent_orchestrator_service import AgentOrchestratorService
 from app_backend.services.external_search_planner_service import ExternalSearchPlannerService
+from app_backend.services.keyword_search_service import KeywordSearchService
 from app_backend.services.library_sync_service import LibrarySyncService
 from app_backend.services.llm_concurrency_limiter import LLMConcurrencyLimiter
 from app_backend.services.memory_service import MemoryService
 from app_backend.services.metadata_extractor import MetadataExtractorService
 from app_backend.services.mcp_external_search_service import MCPExternalSearchService
 from app_backend.services.pdf_parser import PDFParserService
+from app_backend.services.qwen_rerank_service import QwenRerankService
 from app_backend.services.rerank_service import RerankService
 from app_backend.services.retriever_service import RetrieverService
 from app_backend.services.semantic_chunk_service import SemanticChunkService
@@ -60,7 +62,9 @@ class ServiceContainer:
             self.config_service,
             self.semantic_chunk_service,
         )
-        self.rerank_service = RerankService()
+        self.keyword_search_service = KeywordSearchService(self.db_manager)
+        self.qwen_rerank_service = QwenRerankService(self.config_service)
+        self.rerank_service = RerankService(self.qwen_rerank_service)
 
         self.document_ingest_service = DocumentIngestService(
             document_repository=self.document_repository,
@@ -82,6 +86,7 @@ class ServiceContainer:
             library_repository=self.library_repository,
             vector_index_service=self.vector_index_service,
             rerank_service=self.rerank_service,
+            keyword_search_service=self.keyword_search_service,
         )
         self.mcp_tool_invoker = StdioMCPToolInvoker()
         self.external_search_service = MCPExternalSearchService(self.mcp_tool_invoker)

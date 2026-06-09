@@ -58,7 +58,7 @@ class PaperSourceToolRegistry:
             except Exception as exc:
                 errors.append({"source": normalized_source, "message": str(exc)})
                 continue
-            results.extend(source_results[: config.MAX_SOURCE_FINAL_LIMIT])
+            results.extend(source_results)
 
         return {
             "results": [item.to_dict() for item in results],

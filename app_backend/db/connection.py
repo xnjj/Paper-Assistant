@@ -4,6 +4,7 @@ import sqlite3
 from contextlib import contextmanager
 
 import config_data as config
+from app_backend.utils.keyword_text import build_keyword_search_text
 
 
 SCHEMA_SQL = """
@@ -158,6 +159,7 @@ class DatabaseManager:
     def initialize(self) -> None:
         """Create tables and run lightweight migrations."""
         with sqlite3.connect(self.db_path) as connection:
+            connection.row_factory = sqlite3.Row
             connection.executescript(SCHEMA_SQL)
             self._migrate_schema(connection)
             connection.commit()
@@ -172,6 +174,7 @@ class DatabaseManager:
         self._ensure_session_library_nullable(connection)
         self._ensure_sync_job_columns(connection, migration_library_id)
         self._ensure_chunk_columns(connection, migration_library_id)
+        self._ensure_keyword_fts_index(connection)
 
     def _ensure_library_columns(self, connection: sqlite3.Connection) -> None:
         """Add library-level index configuration columns to older databases."""
@@ -438,6 +441,105 @@ class DatabaseManager:
                 """,
                 (migration_library_id,),
             )
+
+    def _ensure_keyword_fts_index(self, connection: sqlite3.Connection) -> None:
+        """创建并回填关键词检索 FTS5 索引；不支持 FTS5 时保留向量检索可用。"""
+        try:
+            self._create_keyword_fts_table(connection)
+        except sqlite3.OperationalError:
+            return
+
+        try:
+            chunk_count = int(
+                connection.execute(
+                    """
+                    SELECT COUNT(1)
+                    FROM document_chunks
+                    WHERE indexable = 1 AND TRIM(chunk_text) != ''
+                    """
+                ).fetchone()[0]
+            )
+            fts_count = int(
+                connection.execute("SELECT COUNT(1) FROM document_chunks_fts").fetchone()[0]
+            )
+        except sqlite3.OperationalError:
+            return
+
+        if fts_count != chunk_count:
+            self._rebuild_keyword_fts_index(connection)
+
+    def _create_keyword_fts_table(self, connection: sqlite3.Connection) -> None:
+        """创建 document_chunks 的 BM25/FTS5 辅助索引表。"""
+        connection.execute(
+            """
+            CREATE VIRTUAL TABLE IF NOT EXISTS document_chunks_fts USING fts5(
+                chunk_id UNINDEXED,
+                library_id UNINDEXED,
+                document_id UNINDEXED,
+                chunk_index UNINDEXED,
+                title,
+                abstract,
+                keywords,
+                section_title,
+                chunk_text,
+                search_text
+            )
+            """
+        )
+
+    def _rebuild_keyword_fts_index(self, connection: sqlite3.Connection) -> None:
+        """根据 documents 与 document_chunks 重建完整关键词索引。"""
+        rows = connection.execute(
+            """
+            SELECT
+                c.id AS chunk_id,
+                c.library_id,
+                c.document_id,
+                c.chunk_index,
+                c.section_title,
+                c.chunk_text,
+                d.title,
+                d.abstract,
+                d.keywords_json
+            FROM document_chunks AS c
+            JOIN documents AS d ON d.id = c.document_id
+            WHERE c.indexable = 1
+              AND TRIM(c.chunk_text) != ''
+            ORDER BY c.library_id ASC, c.document_id ASC, c.chunk_index ASC
+            """
+        ).fetchall()
+
+        connection.execute("DELETE FROM document_chunks_fts")
+        connection.executemany(
+            """
+            INSERT INTO document_chunks_fts(
+                chunk_id, library_id, document_id, chunk_index,
+                title, abstract, keywords, section_title, chunk_text, search_text
+            )
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    int(row["chunk_id"]),
+                    int(row["library_id"]),
+                    int(row["document_id"]),
+                    int(row["chunk_index"]),
+                    row["title"] or "",
+                    row["abstract"] or "",
+                    row["keywords_json"] or "",
+                    row["section_title"] or "",
+                    row["chunk_text"] or "",
+                    build_keyword_search_text(
+                        row["title"],
+                        row["abstract"],
+                        row["keywords_json"],
+                        row["section_title"],
+                        row["chunk_text"],
+                    ),
+                )
+                for row in rows
+            ],
+        )
 
     @staticmethod
     def _table_has_column(connection: sqlite3.Connection, table_name: str, column_name: str) -> bool:

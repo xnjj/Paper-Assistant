@@ -14,23 +14,35 @@ ROOT_DIR = Path(__file__).resolve().parent
 OPENAI_API_KEY = os.getenv("DASHSCOPE_API_KEY", "")
 
 # ---------------------------- 检索配置 ----------------------------
-TOP_K = 100                             # 本地向量召回候选 chunk 数
+TOP_K = 50                              # 本地向量召回候选 chunk 数
+KEYWORD_RECALL_K = 50                   # 关键词 BM25 召回候选 chunk 数，最终会与向量召回做融合
+HYBRID_RRF_K = 60                       # RRF 融合平滑系数，值越大越强调多路召回共同命中
+HYBRID_CANDIDATE_LIMIT = 50             # RRF 融合后送入本地重排器的最大候选 chunk 数
 RECALL_K = 20                           # 本地重排后保留并送入问答的 chunk 数
-CHUNK_LIMIT_PER_PAPER = 5               # 每篇文献最多分块数
+
+# ---------------------------- 重排配置 ----------------------------
+RERANK_PROVIDER = os.getenv("RAG_RERANK_PROVIDER", "qwen")  # 本地候选重排器：qwen 或 rule
+RERANK_MODEL_NAME = os.getenv("RAG_RERANK_MODEL_NAME", "gte-rerank-v2")  # DashScope 重排模型名
+QWEN_RERANK_ENDPOINT = os.getenv(
+    "QWEN_RERANK_ENDPOINT",
+    "https://dashscope.aliyuncs.com/api/v1/services/rerank/text-rerank/text-rerank",
+)  # qwen3-rerank HTTP 接口地址
+RERANK_TIMEOUT_SECONDS = 30             # 单次重排请求超时时间
+RERANK_MAX_DOCUMENTS = 100              # rerank 模型单次送入重排模型的最大候选数
+RERANK_MAX_DOC_CHARS = 4000             # rerank 模型单个候选文本最大 token 数，避免超过模型输入上限
+RERANK_FALLBACK_TO_RULE = True          # 云端重排失败时是否自动回退到规则重排
+RERANK_INSTRUCTION = "根据用户问题，判断候选论文片段是否能直接支撑回答，并按相关性从高到低排序。"
 
 MAX_PARALLEL_EXTERNAL_QUERIES = 3       # 单个外部数据源最大并发请求查询数，防止过大被限流
 MAX_PARALLEL_CROSSREF_QUERIES = 5       # CROSSREF最大并发请求查询数
 MAX_PARALLEL_LLM_QUERIES = 10           # 最大并发 LLM 请求数
-MAX_EXTERNAL_QUERY_LIMIT = 5            # 单个外部数据源单次请求查询返回限制，防止过大被限流
-MAX_SOURCE_FINAL_LIMIT = 10             # 单个外部数据检索最终返回总数限制
+MAX_EXTERNAL_QUERY_LIMIT = 10            # 单个外部数据源单次请求查询返回限制，防止过大被限流
 DEFAULT_EXTERNAL_FINAL_LIMIT = 20       # 所有外部数据源检索返回总数限制
-MAX_SEARCH_NUM = 30                     # 本地+外部检索总返回数限制
+MAX_SEARCH_NUM = 20                     # 本地+外部检索总返回数限制
 
 # ---------------------------- 语义分块配置 ----------------------------
-# 每个语义结构识别任务读取的 PDF 页数；页数越大，上下文越完整，但单次 LLM 请求越慢。
-SEMANTIC_CHUNK_PAGES_PER_BATCH = 3
-# 单篇文献内部最多并发多少个结构识别任务；真实 LLM 总并发仍受 MAX_PARALLEL_LLM_QUERIES 统一限制。
-SEMANTIC_CHUNK_MAX_WORKERS_PER_DOCUMENT = 3
+SEMANTIC_CHUNK_PAGES_PER_BATCH = 3      # 每个语义结构识别任务读取的 PDF 最大页数
+SEMANTIC_CHUNK_MAX_WORKERS_PER_DOCUMENT = 3     # 单篇文献内部最多并发多少个结构识别任务；真实 LLM 总并发仍受 MAX_PARALLEL_LLM_QUERIES 统一限制。
 
 OUTPUT_DIR = os.getenv("RAG_PAPER_ASSISTANT_DATA_DIR", str(ROOT_DIR / "daily_papers"))
 APP_DB_FILE = str(Path(OUTPUT_DIR) / "app_state.db")

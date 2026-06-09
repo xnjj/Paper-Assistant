@@ -213,11 +213,24 @@ interface TraceDetailDocument {
   url?: string
   file_path?: string
   chunk_index?: number | null
+  chunk_end_index?: number | null
+  merged_chunk_indexes?: Array<number | string | null>
+  merged_chunks?: TraceDetailDocument[]
   section_type?: string
   section_title?: string
   section_chunk_index?: number | null
   indexable?: boolean
   rerank_score?: number | string | null
+  qwen_rerank_score?: number | string | null
+  rerank_provider?: string
+  vector_rank?: number | string | null
+  keyword_rank?: number | string | null
+  keyword_score?: number | string | null
+  hybrid_rank?: number | string | null
+  hybrid_score?: number | string | null
+  recall_source?: string
+  evidence_id?: string
+  llm_usefulness?: string
   abstract?: string
   chunk_text?: string
 }
@@ -494,6 +507,7 @@ const configuredFolderPath = ref('')
 const configuredFolderPdfCount = ref<number | null>(null)
 const activeReferenceKey = ref<string | null>(null)
 const expandedReferenceKeys = ref<Record<string, boolean>>({})
+const expandedTraceChunkKeys = ref<Record<string, boolean>>({})
 const traceDetailSpan = ref<AgentTraceSpan | null>(null)
 
 const statusMessage = ref('')
@@ -2115,7 +2129,11 @@ function formatTraceSpanTitle(span: AgentTraceSpan) {
 // 将后端内部阶段名转换为中文展示名。
 function formatTraceSpanName(name: string) {
   const labels: Record<string, string> = {
-    local_retrieval: '本地文献检索',
+    vector_recall: '向量召回',
+    keyword_recall: '关键词召回',
+    hybrid_rrf: '本地检索融合',
+    local_retrieval: '本地检索重排',
+    external_rerank: '外部检索重排',
     coverage_assessment: '证据充分性判断',
     search_plan_generation: '生成检索计划',
     evidence_merge: '证据合并',
@@ -2135,6 +2153,9 @@ function formatTraceSpanType(type: string) {
     llm: 'LLM',
     mcp_tool: 'MCP',
     retriever: 'Retriever',
+    recall: 'RECALL',
+    rrf: 'RRF',
+    rerank: 'RERANK',
     merge: 'Merge',
     prompt: 'Prompt',
     citation: 'Citation',
@@ -2144,7 +2165,7 @@ function formatTraceSpanType(type: string) {
 
 // 生成 trace span 的状态和耗时描述。
 function formatTraceSpanMeta(span: AgentTraceSpan) {
-  const statusText = span.status === 'success' ? '成功' : span.status === 'error' ? '失败' : span.status
+  const statusText = span.status === 'success' ? '成功' : span.status === 'error' ? '失败' : span.status === 'skipped' ? '跳过' : span.status
   const elapsedText = span.elapsedMs !== null ? `，${formatElapsedSeconds(span.elapsedMs / 1000)}秒` : ''
   return `${statusText}${elapsedText}`
 }
@@ -2155,8 +2176,19 @@ function formatTraceSpanSummary(span: AgentTraceSpan) {
     return span.error
   }
 
+  const skipReason = getTraceValue(span.output, 'skip_reason')
+  if (skipReason !== undefined) {
+    return String(skipReason)
+  }
+
   const resultCount = getTraceValue(span.output, 'result_count') ?? getTraceValue(span.metrics, 'result_count')
   if (resultCount !== undefined) {
+    if (span.name === 'local_retrieval' || span.name === 'external_rerank') {
+      const provider = getTraceValue(span.output, 'rerank_provider') ?? getTraceValue(span.input, 'provider')
+      const fallbackUsed = getTraceValue(span.output, 'fallback_used')
+      const providerText = provider ? `（${provider}${fallbackUsed ? '，已回退规则重排' : ''}）` : ''
+      return `返回 ${resultCount} 条结果${providerText}`
+    }
     return `返回 ${resultCount} 条结果`
   }
 
@@ -2203,7 +2235,11 @@ function getTraceValue(record: Record<string, unknown>, key: string) {
 // 判断工具链节点是否有详情可查看。
 function canOpenTraceSpanDetail(span: AgentTraceSpan) {
   return (
+    span.name === 'vector_recall' ||
+    span.name === 'keyword_recall' ||
+    span.name === 'hybrid_rrf' ||
     span.name === 'local_retrieval' ||
+    span.name === 'external_rerank' ||
     span.name === 'evidence_merge' ||
     span.name === 'prompt_build' ||
     span.name.startsWith('external_search.')
@@ -2234,36 +2270,71 @@ function getTraceDetailDocuments(span: AgentTraceSpan | null): TraceDetailDocume
   if (!Array.isArray(documents)) {
     return []
   }
-  return documents
+  const parsedDocuments = documents
     .filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === 'object')
-    .map((item) => ({
-      document_id: item.document_id === null || item.document_id === undefined ? null : String(item.document_id),
-      source_id: String(item.source_id || ''),
-      source_type: String(item.source_type || ''),
-      title: String(item.title || ''),
-      authors: Array.isArray(item.authors) ? item.authors.map((author) => String(author)) : [],
-      year: String(item.year || ''),
-      venue: String(item.venue || ''),
-      doi: String(item.doi || ''),
-      url: String(item.url || ''),
-      file_path: String(item.file_path || ''),
-      chunk_index: item.chunk_index === null || item.chunk_index === undefined ? null : Number(item.chunk_index),
-      section_type: String(item.section_type || ''),
-      section_title: String(item.section_title || ''),
-      section_chunk_index:
-        item.section_chunk_index === null || item.section_chunk_index === undefined
-          ? null
-          : Number(item.section_chunk_index),
-      indexable: item.indexable === undefined ? true : Boolean(item.indexable),
-      rerank_score: item.rerank_score === null || item.rerank_score === undefined ? null : String(item.rerank_score),
-      abstract: String(item.abstract || ''),
-      chunk_text: String(item.chunk_text || ''),
-    }))
+    .map(mapTraceDetailDocument)
+
+  if (span.name.startsWith('external_search.') && parsedDocuments.some(hasActualTraceRerankScore)) {
+    return sortTraceDocumentsByRerankScore(parsedDocuments)
+  }
+  return parsedDocuments
+}
+
+function mapTraceDetailDocument(item: Record<string, unknown>): TraceDetailDocument {
+  const mergedChunks = Array.isArray(item.merged_chunks)
+    ? item.merged_chunks
+        .filter((chunk): chunk is Record<string, unknown> => Boolean(chunk) && typeof chunk === 'object')
+        .map(mapTraceDetailDocument)
+    : []
+
+  return {
+    document_id: item.document_id === null || item.document_id === undefined ? null : String(item.document_id),
+    source_id: String(item.source_id || ''),
+    source_type: String(item.source_type || ''),
+    title: String(item.title || ''),
+    authors: Array.isArray(item.authors) ? item.authors.map((author) => String(author)) : [],
+    year: String(item.year || ''),
+    venue: String(item.venue || ''),
+    doi: String(item.doi || ''),
+    url: String(item.url || ''),
+    file_path: String(item.file_path || ''),
+    chunk_index: item.chunk_index === null || item.chunk_index === undefined ? null : Number(item.chunk_index),
+    chunk_end_index:
+      item.chunk_end_index === null || item.chunk_end_index === undefined ? null : Number(item.chunk_end_index),
+    merged_chunk_indexes: Array.isArray(item.merged_chunk_indexes)
+      ? item.merged_chunk_indexes.map((value) => (value === null || value === undefined ? null : String(value)))
+      : [],
+    merged_chunks: mergedChunks,
+    section_type: String(item.section_type || ''),
+    section_title: String(item.section_title || ''),
+    section_chunk_index:
+      item.section_chunk_index === null || item.section_chunk_index === undefined
+        ? null
+        : Number(item.section_chunk_index),
+    indexable: item.indexable === undefined ? true : Boolean(item.indexable),
+    rerank_score: item.rerank_score === null || item.rerank_score === undefined ? null : String(item.rerank_score),
+    qwen_rerank_score:
+      item.qwen_rerank_score === null || item.qwen_rerank_score === undefined ? null : String(item.qwen_rerank_score),
+    rerank_provider: String(item.rerank_provider || ''),
+    vector_rank: item.vector_rank === null || item.vector_rank === undefined ? null : String(item.vector_rank),
+    keyword_rank: item.keyword_rank === null || item.keyword_rank === undefined ? null : String(item.keyword_rank),
+    keyword_score: item.keyword_score === null || item.keyword_score === undefined ? null : String(item.keyword_score),
+    hybrid_rank: item.hybrid_rank === null || item.hybrid_rank === undefined ? null : String(item.hybrid_rank),
+    hybrid_score: item.hybrid_score === null || item.hybrid_score === undefined ? null : String(item.hybrid_score),
+    recall_source: String(item.recall_source || ''),
+    evidence_id: String(item.evidence_id || ''),
+    llm_usefulness: String(item.llm_usefulness || ''),
+    abstract: String(item.abstract || ''),
+    chunk_text: String(item.chunk_text || ''),
+  }
 }
 
 // 判断工具链详情是否需要按同一篇文献聚合多个分块。
 function shouldGroupTraceDocumentsByPaper(span: AgentTraceSpan | null) {
-  return span?.name === 'local_retrieval'
+  return Boolean(
+    span &&
+      ['vector_recall', 'keyword_recall', 'hybrid_rrf', 'local_retrieval', 'evidence_merge'].includes(span.name),
+  )
 }
 
 // 把本地检索详情按文献聚合，其他详情仍按单条记录展示。
@@ -2277,6 +2348,26 @@ function getTraceDetailDocumentGroups(span: AgentTraceSpan | null): TraceDetailD
     }))
   }
 
+  if (span?.name === 'evidence_merge') {
+    return buildEvidenceMergeDocumentGroups(documents)
+  }
+
+  return groupTraceDocumentsByPaper(documents)
+}
+
+function buildEvidenceMergeDocumentGroups(documents: TraceDetailDocument[]) {
+  const localDocuments = documents.filter((document) => !isExternalTraceDocument(document))
+  const externalDocuments = documents.filter((document) => isExternalTraceDocument(document))
+  const localGroups = groupTraceDocumentsByPaper(localDocuments)
+  const externalGroups = externalDocuments.map((document, index) => ({
+    groupKey: buildTraceDocumentGroupKey(document, index + localGroups.length),
+    document,
+    chunks: [],
+  }))
+  return [...localGroups, ...externalGroups]
+}
+
+function groupTraceDocumentsByPaper(documents: TraceDetailDocument[]) {
   const groups = new Map<string, TraceDetailDocumentGroup>()
   documents.forEach((document, index) => {
     const groupKey = buildTraceDocumentGroupKey(document, index)
@@ -2292,6 +2383,27 @@ function getTraceDetailDocumentGroups(span: AgentTraceSpan | null): TraceDetailD
     })
   })
   return [...groups.values()]
+}
+
+function isExternalTraceDocument(document: TraceDetailDocument) {
+  return (
+    (document.source_type || '').toLowerCase() === 'external' ||
+    (document.source_id || '').toLowerCase().startsWith('ext_')
+  )
+}
+
+function hasActualTraceRerankScore(document: TraceDetailDocument) {
+  const rerankScore = document.qwen_rerank_score ?? document.rerank_score
+  return Boolean(document.rerank_provider && rerankScore !== null && rerankScore !== undefined && rerankScore !== '')
+}
+
+function sortTraceDocumentsByRerankScore(documents: TraceDetailDocument[]) {
+  return [...documents].sort((left, right) => getTraceRerankScoreValue(right) - getTraceRerankScoreValue(left))
+}
+
+function getTraceRerankScoreValue(document: TraceDetailDocument) {
+  const score = Number(document.qwen_rerank_score ?? document.rerank_score)
+  return Number.isFinite(score) ? score : Number.NEGATIVE_INFINITY
 }
 
 // 为同一篇文献构造稳定分组键，优先使用 document_id。
@@ -2337,11 +2449,65 @@ function formatTraceDocumentMeta(document: TraceDetailDocument) {
 
 // 格式化工具链详情文献的重排分数。
 function formatTraceDocumentScore(document: TraceDetailDocument) {
-  if (document.rerank_score === null || document.rerank_score === undefined || document.rerank_score === '') {
+  const labels: string[] = []
+  const formatRankLabel = (label: string, value: number | string | null | undefined) => {
+    const rank = Number(value)
+    return Number.isFinite(rank) ? `${label}#${rank + 1}` : `${label}#${value}`
+  }
+
+  const rerankScore = document.rerank_score ?? document.qwen_rerank_score
+  if (rerankScore !== null && rerankScore !== undefined && rerankScore !== '') {
+    const score = Number(rerankScore)
+    const providerLabel = document.rerank_provider ? `(${document.rerank_provider})` : ''
+    labels.push(Number.isFinite(score) ? `重排${providerLabel} ${score.toFixed(4)}` : `重排${providerLabel} ${rerankScore}`)
+  }
+  if (document.hybrid_score !== null && document.hybrid_score !== undefined && document.hybrid_score !== '') {
+    const score = Number(document.hybrid_score)
+    labels.push(Number.isFinite(score) ? `RRF ${score.toFixed(4)}` : `RRF ${document.hybrid_score}`)
+  }
+  if (document.keyword_score !== null && document.keyword_score !== undefined && document.keyword_score !== '') {
+    const score = Number(document.keyword_score)
+    labels.push(Number.isFinite(score) ? `BM25 ${score.toFixed(4)}` : `BM25 ${document.keyword_score}`)
+  }
+  if (document.vector_rank !== null && document.vector_rank !== undefined && document.vector_rank !== '') {
+    labels.push(formatRankLabel('向量', document.vector_rank))
+  }
+  if (document.keyword_rank !== null && document.keyword_rank !== undefined && document.keyword_rank !== '') {
+    labels.push(formatRankLabel('关键词', document.keyword_rank))
+  }
+  if (document.hybrid_rank !== null && document.hybrid_rank !== undefined && document.hybrid_rank !== '') {
+    labels.push(formatRankLabel('融合', document.hybrid_rank))
+  }
+  if (!labels.length) {
     return ''
   }
-  const score = Number(document.rerank_score)
-  return Number.isFinite(score) ? `重排分数：${score.toFixed(4)}` : `重排分数：${document.rerank_score}`
+  return labels.join(' · ')
+}
+
+function formatTraceRerankScore(document: TraceDetailDocument) {
+  if (!hasActualTraceRerankScore(document)) {
+    return ''
+  }
+  const rerankScore = document.qwen_rerank_score ?? document.rerank_score
+  const score = Number(rerankScore)
+  const providerLabel = document.rerank_provider ? `(${document.rerank_provider})` : ''
+  return Number.isFinite(score) ? `重排${providerLabel} ${score.toFixed(4)}` : `重排${providerLabel} ${rerankScore}`
+}
+
+function formatTraceDocumentHeaderScore(span: AgentTraceSpan | null, document: TraceDetailDocument) {
+  if (!span) {
+    return ''
+  }
+  if (span.name.startsWith('external_search.') || span.name === 'external_rerank') {
+    return formatTraceRerankScore(document)
+  }
+  if (span.name === 'evidence_merge' && isExternalTraceDocument(document)) {
+    return formatTraceRerankScore(document)
+  }
+  if (!shouldGroupTraceDocumentsByPaper(span)) {
+    return formatTraceDocumentScore(document)
+  }
+  return ''
 }
 
 // 格式化同一篇文献下的分块标题。
@@ -2349,9 +2515,88 @@ function formatTraceChunkTitle(chunk: TraceDetailDocument, index: number) {
   const chunkIndex = typeof chunk.chunk_index === 'number' && Number.isFinite(chunk.chunk_index)
     ? chunk.chunk_index
     : null
-  const chunkLabel = chunkIndex === null ? `分块 ${index + 1}` : `分块 ${chunkIndex}`
+  const chunkEndIndex =
+    typeof chunk.chunk_end_index === 'number' && Number.isFinite(chunk.chunk_end_index)
+      ? chunk.chunk_end_index
+      : null
+  const chunkLabel = chunkIndex === null
+    ? `分块 ${index + 1}`
+    : chunkEndIndex !== null && chunkEndIndex !== chunkIndex
+      ? `合并分块 ${chunkIndex}-${chunkEndIndex}`
+      : `分块 ${chunkIndex}`
   const scoreLabel = formatTraceDocumentScore(chunk)
   return scoreLabel ? `${chunkLabel} · ${scoreLabel}` : chunkLabel
+}
+
+function getMergedTraceChunks(chunk: TraceDetailDocument) {
+  return [...(chunk.merged_chunks || [])].sort((left, right) => {
+    const leftIndex = typeof left.chunk_index === 'number' && Number.isFinite(left.chunk_index) ? left.chunk_index : Number.MAX_SAFE_INTEGER
+    const rightIndex = typeof right.chunk_index === 'number' && Number.isFinite(right.chunk_index) ? right.chunk_index : Number.MAX_SAFE_INTEGER
+    return leftIndex - rightIndex
+  })
+}
+
+function shouldShowTraceChunkHeader(span: AgentTraceSpan | null, chunk: TraceDetailDocument) {
+  return !(span?.name === 'evidence_merge' && getMergedTraceChunks(chunk).length > 0)
+}
+
+function shouldShowTraceStandaloneSnippet(span: AgentTraceSpan | null, document: TraceDetailDocument) {
+  return !(span?.name === 'evidence_merge' && isExternalTraceDocument(document))
+}
+
+function formatTraceChunkUsefulness(span: AgentTraceSpan | null, chunk: TraceDetailDocument) {
+  if (span?.name !== 'local_retrieval') {
+    return ''
+  }
+
+  if (chunk.llm_usefulness === 'useful') {
+    return 'LLM判定：有用'
+  }
+  if (chunk.llm_usefulness === 'useless') {
+    return 'LLM判定：无用'
+  }
+  return ''
+}
+
+function shouldCollapseTraceChunks(span: AgentTraceSpan | null) {
+  return Boolean(span && ['vector_recall', 'keyword_recall', 'hybrid_rrf'].includes(span.name))
+}
+
+function buildTraceChunkExpandKey(
+  span: AgentTraceSpan | null,
+  group: TraceDetailDocumentGroup,
+  chunk: TraceDetailDocument,
+  index: number,
+) {
+  const spanKey = span?.spanId || span?.name || 'trace'
+  const chunkIndex = chunk.chunk_index === null || chunk.chunk_index === undefined ? index : chunk.chunk_index
+  return `${spanKey}-${group.groupKey}-${chunkIndex}`
+}
+
+function isTraceChunkExpanded(
+  span: AgentTraceSpan | null,
+  group: TraceDetailDocumentGroup,
+  chunk: TraceDetailDocument,
+  index: number,
+) {
+  return Boolean(expandedTraceChunkKeys.value[buildTraceChunkExpandKey(span, group, chunk, index)])
+}
+
+function toggleTraceChunkExpanded(
+  span: AgentTraceSpan | null,
+  group: TraceDetailDocumentGroup,
+  chunk: TraceDetailDocument,
+  index: number,
+) {
+  if (!shouldCollapseTraceChunks(span)) {
+    return
+  }
+
+  const key = buildTraceChunkExpandKey(span, group, chunk, index)
+  expandedTraceChunkKeys.value = {
+    ...expandedTraceChunkKeys.value,
+    [key]: !expandedTraceChunkKeys.value[key],
+  }
 }
 
 async function flushStreamFrame() {
@@ -3794,8 +4039,8 @@ function isReferenceExpanded(messageId: number, referenceNumber: number) {
             >
               <div class="trace-detail-document__header">
                 <strong>{{ index + 1 }}. {{ group.document.title || '未命名文献' }}</strong>
-                <span v-if="!shouldGroupTraceDocumentsByPaper(traceDetailSpan) && formatTraceDocumentScore(group.document)">
-                  {{ formatTraceDocumentScore(group.document) }}
+                <span v-if="formatTraceDocumentHeaderScore(traceDetailSpan, group.document)">
+                  {{ formatTraceDocumentHeaderScore(traceDetailSpan, group.document) }}
                 </span>
               </div>
               <p class="trace-detail-document__meta">{{ formatTraceDocumentMeta(group.document) }}</p>
@@ -3815,12 +4060,47 @@ function isReferenceExpanded(messageId: number, referenceNumber: number) {
                   v-for="(chunk, chunkIndex) in group.chunks"
                   :key="`${group.groupKey}-${chunk.chunk_index ?? chunkIndex}`"
                   class="trace-detail-chunk"
+                  :class="{
+                    'trace-detail-chunk--clickable': shouldCollapseTraceChunks(traceDetailSpan),
+                    'trace-detail-chunk--expanded': isTraceChunkExpanded(traceDetailSpan, group, chunk, chunkIndex),
+                  }"
+                  @click="toggleTraceChunkExpanded(traceDetailSpan, group, chunk, chunkIndex)"
                 >
-                  <div class="trace-detail-chunk__header">{{ formatTraceChunkTitle(chunk, chunkIndex) }}</div>
-                  <p v-if="chunk.chunk_text" class="trace-detail-document__snippet">{{ chunk.chunk_text }}</p>
+                  <div v-if="shouldShowTraceChunkHeader(traceDetailSpan, chunk)" class="trace-detail-chunk__header">
+                    <span class="trace-detail-chunk__title">{{ formatTraceChunkTitle(chunk, chunkIndex) }}</span>
+                    <span
+                      v-if="formatTraceChunkUsefulness(traceDetailSpan, chunk)"
+                      class="trace-detail-chunk__judgement"
+                    >
+                      {{ formatTraceChunkUsefulness(traceDetailSpan, chunk) }}
+                    </span>
+                  </div>
+                  <div v-if="getMergedTraceChunks(chunk).length" class="trace-detail-merged-chunks">
+                    <div
+                      v-for="(mergedChunk, mergedChunkIndex) in getMergedTraceChunks(chunk)"
+                      :key="`${group.groupKey}-${chunk.chunk_index ?? chunkIndex}-merged-${mergedChunk.chunk_index ?? mergedChunkIndex}`"
+                      class="trace-detail-merged-chunk"
+                    >
+                      {{ formatTraceChunkTitle(mergedChunk, mergedChunkIndex) }}
+                    </div>
+                  </div>
+                  <p
+                    v-if="chunk.chunk_text"
+                    class="trace-detail-document__snippet"
+                    :class="{
+                      'trace-detail-document__snippet--collapsed':
+                        shouldCollapseTraceChunks(traceDetailSpan) &&
+                        !isTraceChunkExpanded(traceDetailSpan, group, chunk, chunkIndex),
+                    }"
+                  >
+                    {{ chunk.chunk_text }}
+                  </p>
                 </div>
               </div>
-              <p v-else-if="group.document.chunk_text" class="trace-detail-document__snippet">
+              <p
+                v-else-if="group.document.chunk_text && shouldShowTraceStandaloneSnippet(traceDetailSpan, group.document)"
+                class="trace-detail-document__snippet"
+              >
                 {{ group.document.chunk_text }}
               </p>
             </article>
@@ -5192,10 +5472,61 @@ function isReferenceExpanded(messageId: number, referenceNumber: number) {
   gap: 0.35rem;
 }
 
+.trace-detail-chunk--clickable {
+  cursor: pointer;
+}
+
+.trace-detail-chunk--clickable:hover {
+  border-radius: 12px;
+  background: rgba(241, 245, 249, 0.78);
+}
+
+.trace-detail-document__snippet--collapsed {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.trace-detail-chunk--expanded .trace-detail-document__snippet {
+  white-space: pre-wrap;
+}
+
 .trace-detail-chunk__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.85rem;
   color: #2563eb;
   font-size: 0.82rem;
   font-weight: 600;
+}
+
+.trace-detail-chunk__title {
+  min-width: 0;
+  flex: 1;
+}
+
+.trace-detail-chunk__judgement {
+  flex-shrink: 0;
+  color: #dc2626;
+  font-size: 0.8rem;
+  font-weight: 700;
+}
+
+.trace-detail-merged-chunks {
+  display: grid;
+  gap: 0.25rem;
+  padding: 0.56rem 0.68rem;
+  border-radius: 12px;
+  background: rgba(37, 99, 235, 0.055);
+}
+
+.trace-detail-merged-chunk {
+  color: #475569;
+  font-size: 0.8rem;
+  line-height: 1.55;
+  overflow-wrap: anywhere;
 }
 
 .message-bubble--user .message-bubble__content :deep(code) {

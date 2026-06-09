@@ -42,6 +42,8 @@ class CoverageAssessment:
     avg_rerank_score: float | None = None
     freshness_gap_detected: bool = False
     recommended_external_limit: int = 0
+    useful_local_evidence_ids: list[str] = field(default_factory=list)
+    discarded_local_evidence_ids: list[str] = field(default_factory=list)
     rationale: str = ""
     evaluator: str = "llm"
 
@@ -83,6 +85,8 @@ class OrchestratedChatContext:
     coverage: CoverageAssessment
     actions: list[AgentActionRecord] = field(default_factory=list)
     pending_ingest: list[PendingIngestRecord] = field(default_factory=list)
+    local_retrieval_trace: dict[str, Any] = field(default_factory=dict)
+    external_rerank_trace: dict[str, Any] = field(default_factory=dict)
 
     def to_prompt_payload(self) -> dict[str, Any]:
         """把编排结果转换为提示词和前端可直接消费的字典。"""
@@ -133,7 +137,6 @@ class AgentOrchestratorService:
         self,
         session_id: int,
         user_message: str,
-        top_k: int = 5,
         external_search_only: bool = False,
         allow_external_search: bool = False,
     ) -> Iterator[AgentEvent]:
@@ -144,11 +147,12 @@ class AgentOrchestratorService:
         session = self._require_session(session_id)
         library = self._get_optional_library(session.library_id)
         memories = self.memory_service.recall_memories(user_message, session_id=session_id, limit=5)
-        # 本地召回/重排数量统一由 config_data.py 固定，忽略前端传入的 top_k，便于测试和复现。
-        effective_top_k = self._get_rerank_chunks()
+        # 最终进入上下文的证据总量统一由 MAX_SEARCH_NUM 控制，避免再叠加单篇文献分块上限。
+        effective_top_k = config.MAX_SEARCH_NUM
 
         if library is None:
             local_documents = []
+            local_retrieval_trace: dict[str, Any] = {}
             actions = self._build_no_library_actions(effective_top_k, allow_external_search=allow_external_search)
             coverage = CoverageAssessment(
                 sufficient=not allow_external_search,
@@ -163,6 +167,7 @@ class AgentOrchestratorService:
             )
         elif external_search_only:
             local_documents: list[dict[str, Any]] = []
+            local_retrieval_trace = {}
             actions = self._build_external_only_actions(library.id, effective_top_k)
             coverage = CoverageAssessment(
                 sufficient=False,
@@ -178,7 +183,7 @@ class AgentOrchestratorService:
                 type="prepare_step",
                 payload={"step": self._build_library_prepare_step(library.name, "running", 0)},
             )
-            local_documents = self._search_local_documents(
+            local_documents, local_retrieval_trace = self._search_local_documents_with_trace(
                 user_message=user_message,
                 library_id=library.id,
                 top_k=effective_top_k,
@@ -202,7 +207,6 @@ class AgentOrchestratorService:
                         "library_id": library.id,
                         "local_recall_k": self._get_recall_chunks(),
                         "local_rerank_k": effective_top_k,
-                        "chunk_limit_per_paper": config.CHUNK_LIMIT_PER_PAPER,
                     },
                 )
             ]
@@ -252,9 +256,13 @@ class AgentOrchestratorService:
                 )
 
         external_documents: list[dict[str, Any]] = []
+        external_rerank_trace: dict[str, Any] = {}
         pending_ingest: list[PendingIngestRecord] = []
+        useful_local_documents = self._filter_useful_local_documents(local_documents, coverage)
+        merged_useful_local_documents = self._merge_adjacent_useful_local_chunks(useful_local_documents)
+        external_search_attempted = allow_external_search and coverage.should_search_external
 
-        if allow_external_search and coverage.should_search_external:
+        if external_search_attempted:
             yield AgentEvent(
                 type="prepare_step",
                 payload={"step": self._build_search_plan_prepare_step("running")},
@@ -309,7 +317,12 @@ class AgentOrchestratorService:
                 )
             )
             external_documents = self._prepare_external_documents(local_documents, external_candidates)
-            external_documents = self._rerank_external_documents(user_message, external_documents)
+            external_quota = self._calculate_external_evidence_quota(merged_useful_local_documents)
+            external_documents, external_rerank_trace = self._rerank_external_documents_with_trace(
+                user_message,
+                external_documents,
+                external_quota=external_quota,
+            )
             if library is not None:
                 pending_ingest = self.decide_ingest_candidates(
                     library_id=library.id,
@@ -327,9 +340,9 @@ class AgentOrchestratorService:
             )
 
         selected_documents = self._select_final_evidence(
-            local_documents=local_documents,
+            useful_local_documents=merged_useful_local_documents,
             external_documents=external_documents,
-            top_k=effective_top_k,
+            external_search_attempted=external_search_attempted,
         )
         retrieval_mode = self._resolve_retrieval_mode(local_documents, external_documents, coverage)
         if library is None and not external_documents:
@@ -346,6 +359,8 @@ class AgentOrchestratorService:
             coverage=coverage,
             actions=actions,
             pending_ingest=pending_ingest,
+            local_retrieval_trace=local_retrieval_trace,
+            external_rerank_trace=external_rerank_trace,
         )
 
         yield AgentEvent(
@@ -442,6 +457,7 @@ class AgentOrchestratorService:
 3. 如果本地候选只命中部分关键词、摘要和片段不能支撑结论、候选为空，或需要更多外部论文补充，则 sufficient 为 false。
 4. 如果 sufficient 为 false，通常应把 should_search_external 设为 true，并给出 1 到 4 个简短 reason_codes。
 5. recommended_external_limit 只在需要外部检索时填写，建议 10 到 20；不需要外部检索时填写 0。
+6. 请同时判断每个本地候选 chunk 是否对回答有直接帮助。useful_local_evidence_ids 只填写有用候选的 evidence_id，discarded_local_evidence_ids 填写明显无关、泛泛而谈或不能支撑回答的 evidence_id。
 
 只输出一个 JSON 对象，不要输出 Markdown 或解释。字段必须为：
 {{
@@ -450,11 +466,13 @@ class AgentOrchestratorService:
   "reason_codes": ["coverage_gap"],
   "freshness_gap_detected": false,
   "recommended_external_limit": 0,
+  "useful_local_evidence_ids": ["doc_1#chunk_0"],
+  "discarded_local_evidence_ids": ["doc_2#chunk_3"],
   "rationale": "一句中文说明"
 }}
 """.strip()
 
-    def _format_documents_for_coverage(self, documents: list[dict[str, Any]], max_items: int = 8) -> str:
+    def _format_documents_for_coverage(self, documents: list[dict[str, Any]], max_items: int = config.MAX_SEARCH_NUM) -> str:
         """把候选文献压缩成适合 LLM 判断证据覆盖度的文本。"""
         if not documents:
             return "无本地候选文献。"
@@ -463,7 +481,8 @@ class AgentOrchestratorService:
         for index, item in enumerate(documents[:max_items], start=1):
             authors = ", ".join(str(author) for author in item.get("authors", []) if str(author).strip())
             lines.append(
-                f"{index}. source_id={item.get('source_id') or item.get('document_id') or 'unknown'}\n"
+                f"{index}. evidence_id={self._build_local_evidence_id(item)}\n"
+                f"   source_id={item.get('source_id') or item.get('document_id') or 'unknown'}\n"
                 f"   标题：{item.get('title') or '未知'}\n"
                 f"   作者：{authors or '未知'}\n"
                 f"   年份：{item.get('year') or '未知'}\n"
@@ -496,6 +515,12 @@ class AgentOrchestratorService:
                 payload.get("recommended_external_limit"),
                 default=max(top_k, config.DEFAULT_EXTERNAL_FINAL_LIMIT),
             )
+        useful_evidence_ids = self._normalize_local_evidence_ids(
+            payload.get("useful_local_evidence_ids") or payload.get("useful_local_source_ids")
+        )
+        discarded_evidence_ids = self._normalize_local_evidence_ids(
+            payload.get("discarded_local_evidence_ids") or payload.get("discarded_local_source_ids")
+        )
 
         return CoverageAssessment(
             sufficient=sufficient,
@@ -506,6 +531,8 @@ class AgentOrchestratorService:
             avg_rerank_score=avg_rerank_score,
             freshness_gap_detected=self._as_bool(payload.get("freshness_gap_detected"), default=False),
             recommended_external_limit=recommended_limit,
+            useful_local_evidence_ids=useful_evidence_ids,
+            discarded_local_evidence_ids=discarded_evidence_ids,
             rationale=str(payload.get("rationale") or "").strip(),
             evaluator="llm",
         )
@@ -623,6 +650,22 @@ class AgentOrchestratorService:
             if len(reason_codes) >= 4:
                 break
         return reason_codes
+
+    def _normalize_local_evidence_ids(self, value: Any) -> list[str]:
+        """规范化 LLM 返回的本地候选 evidence_id 列表。"""
+        if isinstance(value, str):
+            candidates = [value]
+        elif isinstance(value, list):
+            candidates = value
+        else:
+            candidates = []
+
+        evidence_ids: list[str] = []
+        for item in candidates:
+            evidence_id = str(item or "").strip()
+            if evidence_id and evidence_id not in evidence_ids:
+                evidence_ids.append(evidence_id)
+        return evidence_ids
 
     def _normalize_external_limit(self, value: Any, *, default: int) -> int:
         """规范化 LLM 建议的外部检索数量。"""
@@ -866,17 +909,42 @@ class AgentOrchestratorService:
         }
         return len(source_ids)
 
-    def _search_local_documents(self, *, user_message: str, library_id: int, top_k: int) -> list[dict[str, Any]]:
-        """调用本地 retriever，并为结果补充稳定 source_id。"""
-        return [
-            self._attach_source_id(document)
-            for document in self.retriever_service.search(
-                user_message,
-                library_id=library_id,
-                top_k=top_k,
-                recall_k=self._get_recall_chunks(),
-            )
-        ]
+    def _search_local_documents_with_trace(
+        self,
+        *,
+        user_message: str,
+        library_id: int,
+        top_k: int,
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        """调用本地 hybrid retriever，并返回最终结果和可观测 trace 数据。"""
+        search_result = self.retriever_service.search_with_trace(
+            user_message,
+            library_id=library_id,
+            top_k=top_k,
+            recall_k=self._get_recall_chunks(),
+        )
+        documents = [self._attach_source_id(document) for document in search_result.get("documents", [])]
+        trace = self._attach_source_ids_to_local_trace(search_result.get("trace") or {})
+        return documents, trace
+
+    def _attach_source_ids_to_local_trace(self, trace: dict[str, Any]) -> dict[str, Any]:
+        """为本地检索各阶段 trace 文档补充稳定 source_id，便于前端详情展示。"""
+        normalized_trace: dict[str, Any] = {}
+        for key, value in trace.items():
+            if not isinstance(value, dict):
+                continue
+            documents = value.get("documents")
+            normalized_trace[key] = {
+                **value,
+                "documents": [
+                    self._attach_source_id(document)
+                    for document in documents
+                    if isinstance(document, dict)
+                ]
+                if isinstance(documents, list)
+                else [],
+            }
+        return normalized_trace
 
     def _build_external_search_plan(
         self,
@@ -970,38 +1038,279 @@ class AgentOrchestratorService:
             )
         return prepared
 
-    def _rerank_external_documents(
+    def _rerank_external_documents_with_trace(
         self,
         user_message: str,
         external_documents: list[dict[str, Any]],
-    ) -> list[dict[str, Any]]:
-        """对不同外部数据源返回的候选统一重排并截取最终外部证据数量。"""
+        *,
+        external_quota: int,
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        """对不同外部数据源返回的候选统一重排，并返回 trace 诊断数据。"""
         if not external_documents:
-            return []
-        return self.retriever_service.rerank_service.rerank_external_papers(
+            return [], {}
+
+        normalized_quota = max(0, min(int(external_quota), config.MAX_SEARCH_NUM))
+        if normalized_quota <= 0:
+            return [], self._build_skipped_external_rerank_trace(
+                external_documents=external_documents,
+                external_quota=normalized_quota,
+                selected_documents=[],
+                reason="本地有用证据已占满最终上下文额度，跳过外部重排。",
+            )
+
+        if len(external_documents) <= normalized_quota:
+            selected_documents = external_documents[:normalized_quota]
+            return selected_documents, self._build_skipped_external_rerank_trace(
+                external_documents=external_documents,
+                external_quota=normalized_quota,
+                selected_documents=selected_documents,
+                reason="外部候选数未超过最终上下文可用额度，跳过外部重排。",
+            )
+
+        rerank_candidates = external_documents[: config.RERANK_MAX_DOCUMENTS]
+        started_at = time.perf_counter()
+        reranked_documents = self.retriever_service.rerank_service.rerank_external_papers(
             query=user_message,
-            candidates=external_documents,
-            top_k=config.DEFAULT_EXTERNAL_FINAL_LIMIT,
+            candidates=rerank_candidates,
+            top_k=normalized_quota,
         )
+        elapsed_ms = int((time.perf_counter() - started_at) * 1000)
+        trace = {
+            "elapsed_ms": elapsed_ms,
+            "candidate_count": len(rerank_candidates),
+            "result_count": len(reranked_documents),
+            "top_k": normalized_quota,
+            "external_quota": normalized_quota,
+            "skipped": False,
+            "skip_reason": "",
+            **self._build_external_rerank_trace_metadata(reranked_documents),
+            "documents": reranked_documents,
+        }
+        return reranked_documents, trace
+
+    def _build_skipped_external_rerank_trace(
+        self,
+        *,
+        external_documents: list[dict[str, Any]],
+        external_quota: int,
+        selected_documents: list[dict[str, Any]],
+        reason: str,
+    ) -> dict[str, Any]:
+        """构造跳过外部重排时的 trace 数据，方便前端保留可观测记录。"""
+        return {
+            "elapsed_ms": 0,
+            "candidate_count": len(external_documents),
+            "result_count": len(selected_documents),
+            "top_k": external_quota,
+            "external_quota": external_quota,
+            "provider": "",
+            "fallback_used": False,
+            "fallback_error": "",
+            "skipped": True,
+            "skip_reason": reason,
+            "documents": selected_documents,
+        }
+
+    def _build_external_rerank_trace_metadata(self, documents: list[dict[str, Any]]) -> dict[str, Any]:
+        """从外部重排结果中提取 trace 可展示的来源信息。"""
+        if not documents:
+            return {
+                "provider": "unknown",
+                "fallback_used": False,
+                "fallback_error": "",
+            }
+        first = documents[0]
+        return {
+            "provider": first.get("rerank_provider") or "unknown",
+            "fallback_used": bool(first.get("rerank_fallback_used")),
+            "fallback_error": str(first.get("rerank_error") or ""),
+        }
 
     def _select_final_evidence(
         self,
         *,
-        local_documents: list[dict[str, Any]],
+        useful_local_documents: list[dict[str, Any]],
         external_documents: list[dict[str, Any]],
-        top_k: int,
+        external_search_attempted: bool,
     ) -> list[dict[str, Any]]:
         """从本地与外部证据中选出最终送入提示词的结果。"""
         if not external_documents:
-            return local_documents[: self._get_rerank_chunks()]
-        if not local_documents:
-            return external_documents[: config.DEFAULT_EXTERNAL_FINAL_LIMIT]
+            return useful_local_documents[: config.MAX_SEARCH_NUM]
+        if not useful_local_documents:
+            return external_documents[: config.MAX_SEARCH_NUM]
 
-        local_limit = max(0, config.MAX_SEARCH_NUM - config.DEFAULT_EXTERNAL_FINAL_LIMIT)
-        external_limited = external_documents[: config.DEFAULT_EXTERNAL_FINAL_LIMIT]
-        local_limited = local_documents[:local_limit]
-        # 不混排本地重排分和外部检索分，按来源固定配额拼接，避免不同评分尺度互相干扰。
+        local_limited = useful_local_documents[: config.MAX_SEARCH_NUM]
+        external_limit = max(0, config.MAX_SEARCH_NUM - len(local_limited))
+        external_limited = external_documents[:external_limit]
+        # 不混排本地重排分和外部重排分；先保留 LLM 判定有用的本地证据，再用外部证据补足上下文。
         return [*local_limited, *external_limited][: config.MAX_SEARCH_NUM]
+
+    def _merge_adjacent_useful_local_chunks(self, documents: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """把同一篇文献中相邻的有用 chunk 合并为一个最终证据块。"""
+        if not documents:
+            return []
+
+        grouped_documents: dict[str, list[tuple[int, dict[str, Any]]]] = {}
+        for order, document in enumerate(documents):
+            if str(document.get("source_type") or "local").lower() == "external":
+                continue
+            group_key = self._build_local_document_group_key(document, order)
+            grouped_documents.setdefault(group_key, []).append((order, document))
+
+        merged_documents: list[tuple[int, dict[str, Any]]] = []
+        for items in grouped_documents.values():
+            ordered_items = sorted(
+                items,
+                key=lambda item: (
+                    self._chunk_sort_key(item[1].get("chunk_index")),
+                    item[0],
+                ),
+            )
+            current_run: list[tuple[int, dict[str, Any]]] = []
+            previous_chunk_index: int | None = None
+            for item in ordered_items:
+                chunk_index = self._coerce_chunk_index(item[1].get("chunk_index"))
+                if (
+                    current_run
+                    and chunk_index is not None
+                    and previous_chunk_index is not None
+                    and chunk_index == previous_chunk_index + 1
+                ):
+                    current_run.append(item)
+                else:
+                    if current_run:
+                        merged_documents.append(self._merge_local_chunk_run(current_run))
+                    current_run = [item]
+                previous_chunk_index = chunk_index
+            if current_run:
+                merged_documents.append(self._merge_local_chunk_run(current_run))
+
+        merged_documents.sort(key=lambda item: item[0])
+        return [document for _, document in merged_documents]
+
+    def _build_local_document_group_key(self, document: dict[str, Any], fallback_order: int) -> str:
+        """构造本地文献合并分组键，优先按 document_id 合并。"""
+        document_id = document.get("document_id")
+        if document_id is not None:
+            return f"document:{document_id}"
+        source_id = str(document.get("source_id") or "").strip()
+        if source_id:
+            return f"source:{source_id}"
+        file_path = str(document.get("file_path") or "").strip()
+        if file_path:
+            return f"file:{file_path}"
+        return f"fallback:{fallback_order}"
+
+    def _merge_local_chunk_run(self, run_items: list[tuple[int, dict[str, Any]]]) -> tuple[int, dict[str, Any]]:
+        """合并一组同文献且 chunk_index 连续的候选分块。"""
+        ordered_documents = [dict(document) for _, document in run_items]
+        first_order = min(order for order, _ in run_items)
+        if len(ordered_documents) == 1:
+            return first_order, ordered_documents[0]
+
+        merged_document = dict(ordered_documents[0])
+        chunk_indexes = [document.get("chunk_index") for document in ordered_documents]
+        merged_document["chunk_index"] = chunk_indexes[0]
+        merged_document["chunk_end_index"] = chunk_indexes[-1]
+        merged_document["merged_chunk_indexes"] = chunk_indexes
+        merged_document["merged_chunks"] = ordered_documents
+        merged_document["chunk_text"] = "\n\n".join(
+            str(document.get("chunk_text") or "").strip()
+            for document in ordered_documents
+            if str(document.get("chunk_text") or "").strip()
+        )
+        merged_document["rerank_score"] = self._max_numeric_field(ordered_documents, "rerank_score")
+        merged_document["qwen_rerank_score"] = self._max_numeric_field(ordered_documents, "qwen_rerank_score")
+        merged_document["keyword_score"] = self._max_numeric_field(ordered_documents, "keyword_score")
+        merged_document["hybrid_score"] = self._max_numeric_field(ordered_documents, "hybrid_score")
+        merged_document["vector_rank"] = self._min_numeric_field(ordered_documents, "vector_rank")
+        merged_document["keyword_rank"] = self._min_numeric_field(ordered_documents, "keyword_rank")
+        merged_document["hybrid_rank"] = self._min_numeric_field(ordered_documents, "hybrid_rank")
+        return first_order, merged_document
+
+    def _coerce_chunk_index(self, value: Any) -> int | None:
+        """把 chunk_index 规范化为整数，无法解析时返回 None。"""
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
+    def _chunk_sort_key(self, value: Any) -> int:
+        """生成可排序的 chunk_index 键，缺失值排在最后。"""
+        chunk_index = self._coerce_chunk_index(value)
+        return chunk_index if chunk_index is not None else 10**9
+
+    def _max_numeric_field(self, documents: list[dict[str, Any]], field_name: str) -> Any:
+        """读取一组分块中指定数值字段的最大值，保留原始空值语义。"""
+        values = [self._coerce_float(document.get(field_name)) for document in documents]
+        numeric_values = [value for value in values if value is not None]
+        return max(numeric_values) if numeric_values else documents[0].get(field_name)
+
+    def _min_numeric_field(self, documents: list[dict[str, Any]], field_name: str) -> Any:
+        """读取一组分块中指定排名字段的最小值，排名越小表示越靠前。"""
+        values = [self._coerce_float(document.get(field_name)) for document in documents]
+        numeric_values = [value for value in values if value is not None]
+        if not numeric_values:
+            return documents[0].get(field_name)
+        minimum = min(numeric_values)
+        return int(minimum) if float(minimum).is_integer() else minimum
+
+    def _coerce_float(self, value: Any) -> float | None:
+        """把可能来自 trace 的数值字段转换为 float。"""
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    def _calculate_external_evidence_quota(self, useful_local_documents: list[dict[str, Any]]) -> int:
+        """根据有用本地证据数量计算外部文献在最终上下文中的可用额度。"""
+        local_count = min(len(useful_local_documents), config.MAX_SEARCH_NUM)
+        return max(0, config.MAX_SEARCH_NUM - local_count)
+
+    def _filter_useful_local_documents(
+        self,
+        local_documents: list[dict[str, Any]],
+        coverage: CoverageAssessment,
+    ) -> list[dict[str, Any]]:
+        """根据充分性判断结果过滤明显无用的本地候选 chunk。"""
+        if not local_documents:
+            return []
+
+        useful_ids = set(coverage.useful_local_evidence_ids)
+        discarded_ids = set(coverage.discarded_local_evidence_ids)
+        if useful_ids:
+            filtered = [
+                document
+                for document in local_documents
+                if self._local_document_matches_evidence_ids(document, useful_ids)
+            ]
+            if filtered:
+                return filtered
+
+        if discarded_ids:
+            return [
+                document
+                for document in local_documents
+                if not self._local_document_matches_evidence_ids(document, discarded_ids)
+            ]
+
+        return local_documents
+
+    def _local_document_matches_evidence_ids(self, document: dict[str, Any], evidence_ids: set[str]) -> bool:
+        """判断本地候选是否命中 LLM 标记的 evidence_id，兼容文献级 source_id。"""
+        source_id = str(document.get("source_id") or "").strip()
+        evidence_id = self._build_local_evidence_id(document)
+        return evidence_id in evidence_ids or (source_id and source_id in evidence_ids)
+
+    def _build_local_evidence_id(self, document: dict[str, Any]) -> str:
+        """为本地候选 chunk 构造稳定 evidence_id，供充分性判断按分块过滤。"""
+        source_id = str(document.get("source_id") or "").strip()
+        if not source_id and document.get("document_id") is not None:
+            source_id = self._build_source_id(int(document["document_id"]))
+        source_id = source_id or "unknown_source"
+        chunk_index = document.get("chunk_index")
+        chunk_text = chunk_index if chunk_index is not None else "unknown"
+        return f"{source_id}#chunk_{chunk_text}"
 
     def _resolve_retrieval_mode(
         self,

@@ -472,19 +472,14 @@ class MCPExternalSearchService(ExternalSearchService):
         )
 
     def _dedupe_candidates(self, candidates: list[ExternalPaperCandidate]) -> list[ExternalPaperCandidate]:
-        """按 DOI、arXiv ID、URL、标题去重，并限制每个来源最多返回的结果数。"""
+        """按 DOI、arXiv ID、URL、标题去重，保留所有来源进入统一重排。"""
         deduped: list[ExternalPaperCandidate] = []
         seen_keys: set[str] = set()
-        source_counts: dict[str, int] = {}
         for candidate in candidates:
-            source = (candidate.source or self.default_source).strip().lower() or self.default_source
-            if source_counts.get(source, 0) >= config.MAX_SOURCE_FINAL_LIMIT:
-                continue
             keys = self._build_candidate_unique_keys(candidate)
             if not keys or any(key in seen_keys for key in keys):
                 continue
             seen_keys.update(keys)
-            source_counts[source] = source_counts.get(source, 0) + 1
             deduped.append(candidate)
         return deduped
 

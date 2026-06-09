@@ -109,7 +109,7 @@ class ExternalSearchPlannerService:
             "你是外部学术检索代理。"
             "当用户请求论文检索或研究现状时，必须生成可执行的外部检索计划。"
             f"当前年份是 {current_year}。"
-            "对于“最近3年”这类时间条件，请换算 date_from，格式必须是 yyyymmdd。"
+            "对于明确时间限制条件（例如：最近x年），可以换算 date_from，格式必须是 yyyymmdd，如果没有时间限制，可为空。"
             f"请把复杂主题拆成最多 {MAX_PARALLEL_EXTERNAL_QUERIES} 组关键词。"
             f"每条 query 的 limit 不超过 {MAX_EXTERNAL_QUERY_LIMIT}。"
             "sources 字段默认同时使用 arxiv 和 openalex。"

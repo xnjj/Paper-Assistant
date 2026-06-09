@@ -9,8 +9,6 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
-
-import config_data as config
 from app_backend.bootstrap import ServiceContainer
 
 app = FastAPI(title="RAG Paper Assistant API")
@@ -59,7 +57,6 @@ class UpdateSessionRequest(BaseModel):
 
 class ChatRequest(BaseModel):
     message: str
-    top_k: int = config.RECALL_K
     allow_external_search: bool = False
 
 
@@ -84,16 +81,10 @@ class LibraryModelConfigPayload(BaseModel):
     chunk_mode: str | None = None
 
 
-class SessionModelConfigPayload(BaseModel):
-    recall_chunks: int
-    rerank_chunks: int
-
-
 class UpdateModelConfigRequest(BaseModel):
     library_id: int | None = None
     global_config: GlobalModelConfigPayload | None = None
     library_config: LibraryModelConfigPayload | None = None
-    session_config: SessionModelConfigPayload | None = None
 
 
 def resolve_library_id(library_id: int | None) -> int:
@@ -145,7 +136,6 @@ def update_model_config(payload: UpdateModelConfigRequest) -> dict[str, object]:
             library_id=payload.library_id,
             global_config=payload.global_config.model_dump() if payload.global_config else None,
             library_config=payload.library_config.model_dump() if payload.library_config else None,
-            session_config=payload.session_config.model_dump() if payload.session_config else None,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -391,7 +381,6 @@ def stream_chat_with_session(session_id: int, payload: ChatRequest) -> Streaming
             for event in container.chat_service.stream_chat(
                 session_id=session_id,
                 user_message=payload.message,
-                top_k=payload.top_k,
                 allow_external_search=payload.allow_external_search,
             ):
                 yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"

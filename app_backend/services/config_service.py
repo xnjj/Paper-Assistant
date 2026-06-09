@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import config_data as config
 from app_backend.repositories.config_repository import ConfigRepository
 from app_backend.repositories.library_repository import LibraryRepository
 
@@ -23,7 +22,6 @@ class ConfigService:
         self._validate_library(library_id)
 
         global_config = self._merge_global_config()
-        session_config = self._merge_session_config()
         library_config = self._get_library_index_config(library_id)
         requested_chunk_mode = str(library_config["chunk_mode"])
         effective_chunk_mode = self.get_effective_chunk_mode(library_id)
@@ -37,7 +35,6 @@ class ConfigService:
                 "effective_chunk_mode": effective_chunk_mode,
                 "semantic_chunking_enabled": effective_chunk_mode == "semantic",
             },
-            "session": session_config,
             "library_id": library_id,
         }
 
@@ -47,7 +44,6 @@ class ConfigService:
         library_id: int | None,
         global_config: dict[str, object] | None = None,
         library_config: dict[str, object] | None = None,
-        session_config: dict[str, object] | None = None,
     ) -> dict[str, object]:
         """Persist one or more layered config sections."""
         self._validate_library(library_id)
@@ -72,10 +68,6 @@ class ConfigService:
                 )
                 if not updated:
                     raise ValueError("No library index fields were updated.")
-
-        if session_config is not None:
-            # 检索块数已改为代码常量，保留入参兼容旧前端，但不再持久化用户配置。
-            self._normalize_session_config(session_config)
 
         self.config_repository.set_many_json_values(pending_updates)
         return self.get_model_config(library_id)
@@ -143,12 +135,6 @@ class ConfigService:
             "请先选择文献库并配置向量模型最大输入 Token 数。",
         )
 
-    def get_recall_chunks(self) -> int:
-        return config.TOP_K
-
-    def get_rerank_chunks(self) -> int:
-        return config.RECALL_K
-
     def get_requested_chunk_mode(self, library_id: int | None) -> str:
         return str(self._get_library_index_config(library_id)["chunk_mode"])
 
@@ -176,13 +162,6 @@ class ConfigService:
             "embedding_max_input_tokens": self._as_optional_positive_int(
                 payloads.get(self._global_key("embedding_max_input_tokens")),
             ),
-        }
-
-    def _merge_session_config(self) -> dict[str, object]:
-        # 会话级检索数量固定由 config_data.py 管理，不再读取数据库运行时配置。
-        return {
-            "recall_chunks": config.TOP_K,
-            "rerank_chunks": config.RECALL_K,
         }
 
     def _get_library_chunk_mode(self, library_id: int | None) -> str:
@@ -253,25 +232,6 @@ class ConfigService:
 
         return normalized
 
-    def _normalize_session_config(self, payload: dict[str, object]) -> dict[str, object]:
-        merged = self._merge_session_config()
-        recall_chunks = self._require_positive_int(
-            payload.get("recall_chunks"),
-            "recall_chunks",
-            int(merged["recall_chunks"]),
-        )
-        rerank_chunks = self._require_positive_int(
-            payload.get("rerank_chunks"),
-            "rerank_chunks",
-            int(merged["rerank_chunks"]),
-        )
-        if recall_chunks < rerank_chunks:
-            raise ValueError("recall_chunks must be greater than or equal to rerank_chunks.")
-        return {
-            "recall_chunks": recall_chunks,
-            "rerank_chunks": rerank_chunks,
-        }
-
     def _validate_library(self, library_id: int | None) -> None:
         if library_id is None:
             return
@@ -282,10 +242,6 @@ class ConfigService:
     @staticmethod
     def _global_key(name: str) -> str:
         return f"global.{name}"
-
-    @staticmethod
-    def _session_key(name: str) -> str:
-        return f"session.{name}"
 
     @staticmethod
     def _as_optional_str(value: object) -> str:
